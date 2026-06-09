@@ -148,7 +148,12 @@ func (h *Handler) GetAlarms(c *gin.Context) {
 	active := c.Query("active")
 
 	if active == "true" {
-		alarms := services.AlarmEngine.GetActiveAlarms()
+		var alarms []*models.Alarm
+		if services.AlarmRouter != nil && services.AlarmRouter.IsRunning() {
+			alarms = services.AlarmRouter.GetActiveAlarms()
+		} else {
+			alarms = services.AlarmEngine.GetActiveAlarms()
+		}
 		c.JSON(http.StatusOK, alarms)
 		return
 	}
@@ -200,7 +205,11 @@ func (h *Handler) AcknowledgeAlarm(c *gin.Context) {
 		req.AcknowledgedBy = "system"
 	}
 
-	err = services.AlarmEngine.AcknowledgeAlarm(id, req.AcknowledgedBy)
+	if services.AlarmRouter != nil && services.AlarmRouter.IsRunning() {
+		err = services.AlarmRouter.AcknowledgeAlarm(id, req.AcknowledgedBy)
+	} else {
+		err = services.AlarmEngine.AcknowledgeAlarm(id, req.AcknowledgedBy)
+	}
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -210,7 +219,12 @@ func (h *Handler) AcknowledgeAlarm(c *gin.Context) {
 }
 
 func (h *Handler) GetLeaks(c *gin.Context) {
-	leaks := services.LeakDetector.GetCurrentLeaks()
+	var leaks []*models.LeakSource
+	if services.LeakLocator != nil && services.LeakLocator.IsRunning() {
+		leaks = services.LeakLocator.GetCurrentLeaks()
+	} else {
+		leaks = services.LeakDetector.GetCurrentLeaks()
+	}
 	c.JSON(http.StatusOK, leaks)
 }
 
@@ -222,7 +236,11 @@ func (h *Handler) ResolveLeak(c *gin.Context) {
 		return
 	}
 
-	err = services.LeakDetector.ResolveLeak(id)
+	if services.LeakLocator != nil && services.LeakLocator.IsRunning() {
+		err = services.LeakLocator.ResolveLeak(id)
+	} else {
+		err = services.LeakDetector.ResolveLeak(id)
+	}
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -379,8 +397,13 @@ func (h *Handler) ControlFan(c *gin.Context) {
 func (h *Handler) ResetZone(c *gin.Context) {
 	fireZone := c.Param("zone")
 
-	ec := services.NewEmergencyControlService()
-	err := ec.ResetZone(fireZone)
+	var err error
+	if services.EmergencyController != nil && services.EmergencyController.IsRunning() {
+		err = services.EmergencyController.ResetZone(fireZone)
+	} else {
+		ec := services.NewEmergencyControlService()
+		err = ec.ResetZone(fireZone)
+	}
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -394,7 +417,12 @@ func (h *Handler) ResetZone(c *gin.Context) {
 }
 
 func (h *Handler) GetWindData(c *gin.Context) {
-	windSpeed, windDir, temperature := services.LeakDetector.GetWindData()
+	var windSpeed, windDir, temperature float64
+	if services.LeakLocator != nil && services.LeakLocator.IsRunning() {
+		windSpeed, windDir, temperature = services.LeakLocator.GetWindData()
+	} else {
+		windSpeed, windDir, temperature = services.LeakDetector.GetWindData()
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"wind_speed":  windSpeed,
 		"wind_dir":    windDir,
@@ -403,39 +431,54 @@ func (h *Handler) GetWindData(c *gin.Context) {
 }
 
 func (h *Handler) GetStatistics(c *gin.Context) {
-	activeAlarms := len(services.AlarmEngine.GetActiveAlarms())
-	activeLeaks := len(services.LeakDetector.GetCurrentLeaks())
+	var activeAlarms, activeLeaks int
+	if services.AlarmRouter != nil && services.AlarmRouter.IsRunning() {
+		activeAlarms = len(services.AlarmRouter.GetActiveAlarms())
+	} else {
+		activeAlarms = len(services.AlarmEngine.GetActiveAlarms())
+	}
+	if services.LeakLocator != nil && services.LeakLocator.IsRunning() {
+		activeLeaks = len(services.LeakLocator.GetCurrentLeaks())
+	} else {
+		activeLeaks = len(services.LeakDetector.GetCurrentLeaks())
+	}
 
 	rows, _ := services.DB.PG().Query(context.Background(),
+		"SELECT COUNT(*) FROM detectors")
+	totalDetectors := 0
+	if rows.Next() {
+		rows.Scan(&totalDetectors)
+	}
+	rows.Close()
+
+	rows, _ = services.DB.PG().Query(context.Background(),
 		"SELECT COUNT(*) FROM detectors WHERE status = 'normal'")
-	normalDetectors := 0
+	onlineDetectors := 0
 	if rows.Next() {
-		rows.Scan(&normalDetectors)
+		rows.Scan(&onlineDetectors)
 	}
 	rows.Close()
 
-	rows, _ = services.DB.PG().Query(context.Background(),
-		"SELECT COUNT(*) FROM detectors WHERE status != 'normal'")
-	faultDetectors := 0
-	if rows.Next() {
-		rows.Scan(&faultDetectors)
+	concentrations, _ := services.DB.GetCurrentConcentrations()
+	var avgConcentration, maxConcentration float64
+	if len(concentrations) > 0 {
+		var sum float64
+		for _, conc := range concentrations {
+			sum += conc
+			if conc > maxConcentration {
+				maxConcentration = conc
+			}
+		}
+		avgConcentration = sum / float64(len(concentrations))
 	}
-	rows.Close()
-
-	rows, _ = services.DB.PG().Query(context.Background(),
-		"SELECT COUNT(*) FROM alarms WHERE timestamp > NOW() - INTERVAL '24 hours'")
-	alarmCount24h := 0
-	if rows.Next() {
-		rows.Scan(&alarmCount24h)
-	}
-	rows.Close()
 
 	c.JSON(http.StatusOK, gin.H{
+		"total_detectors":    totalDetectors,
+		"online_detectors":   onlineDetectors,
 		"active_alarms":      activeAlarms,
-		"active_leaks":       activeLeaks,
-		"normal_detectors":   normalDetectors,
-		"fault_detectors":    faultDetectors,
-		"alarm_count_24h":    alarmCount24h,
+		"active_leak_sources": activeLeaks,
+		"avg_concentration":  avgConcentration,
+		"max_concentration":  maxConcentration,
 	})
 }
 
@@ -443,9 +486,27 @@ func (h *Handler) WebSocket(c *gin.Context) {
 	services.WSService.HandleConnection(c.Writer, c.Request)
 }
 
-func (h *Handler) Health(c *gin.Context) {
+func (h *Handler) GetReceiverStats(c *gin.Context) {
+	if services.LaserReceiver != nil && services.LaserReceiver.IsRunning() {
+		stats := services.LaserReceiver.GetStats()
+		c.JSON(http.StatusOK, stats)
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{
+		"running": false,
+	})
+}
+
+func (h *Handler) Health(c *gin.Context) {
+	status := gin.H{
 		"status": "ok",
 		"time":   time.Now(),
-	})
+		"modules": gin.H{
+			"laser_receiver":       services.LaserReceiver != nil && services.LaserReceiver.IsRunning(),
+			"alarm_router":         services.AlarmRouter != nil && services.AlarmRouter.IsRunning(),
+			"leak_locator":         services.LeakLocator != nil && services.LeakLocator.IsRunning(),
+			"emergency_controller": services.EmergencyController != nil && services.EmergencyController.IsRunning(),
+		},
+	}
+	c.JSON(http.StatusOK, status)
 }

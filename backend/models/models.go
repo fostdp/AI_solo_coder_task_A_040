@@ -39,6 +39,15 @@ type InfluxSensorData struct {
 	Timestamp   time.Time
 }
 
+type ValidatedData struct {
+	DeviceID      string
+	Concentration float64
+	Timestamp     time.Time
+	IsValid       bool
+	FailReason    string
+	RawData       *SensorData
+}
+
 type Alarm struct {
 	ID          uuid.UUID `json:"id" db:"id"`
 	DeviceID    string    `json:"device_id" db:"device_id"`

@@ -319,6 +319,14 @@ func (m *MQTTService) handleSensorData(client mqtt.Client, msg mqtt.Message) {
 }
 
 func (m *MQTTService) processSensorData(data *models.SensorData) {
+	if services.LaserReceiver != nil && services.LaserReceiver.IsRunning() {
+		services.LaserReceiver.ProcessData(data)
+	} else {
+		m.processSensorDataLegacy(data)
+	}
+}
+
+func (m *MQTTService) processSensorDataLegacy(data *models.SensorData) {
 	isLaser := strings.HasPrefix(data.DeviceID, "LASER-")
 
 	if isLaser {
@@ -339,16 +347,20 @@ func (m *MQTTService) processSensorData(data *models.SensorData) {
 		}
 		services.DB.WriteSensorData(influxData)
 
-		go services.AlarmEngine.CheckAlarm(data.DeviceID, data.Concentration)
-		go services.LeakDetector.AddReading(data.DeviceID, data)
+		if services.AlarmEngine != nil {
+			go services.AlarmEngine.CheckAlarm(data.DeviceID, data.Concentration)
+		}
+		if services.LeakDetector != nil {
+			go services.LeakDetector.AddReading(data.DeviceID, data)
+		}
 	} else {
 		influxData := &models.InfluxSensorData{
 			Measurement: "environment",
 			Tags: map[string]string{
-				"device_id": data.DeviceID,
-				"sensor_type": getSensorType(data.DeviceID),
+				"device_id":     data.DeviceID,
+				"sensor_type":   getSensorType(data.DeviceID),
 				"location_type": getLocationType(data.DeviceID),
-				"fire_zone": getFireZone(data.DeviceID),
+				"fire_zone":     getFireZone(data.DeviceID),
 			},
 			Fields: map[string]interface{}{
 				"temperature": data.Temperature,

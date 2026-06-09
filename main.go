@@ -9,6 +9,11 @@ import (
 
 	"gas-monitoring-system/backend/api"
 	"gas-monitoring-system/backend/config"
+	"gas-monitoring-system/backend/models"
+	"gas-monitoring-system/backend/modules/alarm_router"
+	"gas-monitoring-system/backend/modules/emergency_controller"
+	"gas-monitoring-system/backend/modules/laser_receiver"
+	"gas-monitoring-system/backend/modules/leak_locator"
 	"gas-monitoring-system/backend/mqtt"
 	"gas-monitoring-system/backend/services"
 )
@@ -30,6 +35,8 @@ func main() {
 	defer services.DB.Close()
 
 	services.InitAlarmEngine(&cfg.Alarm, &cfg.SMS)
+	services.InitWebSocket()
+	defer services.WSService.Close()
 
 	if err := mqtt.InitMQTT(&cfg.MQTT); err != nil {
 		log.Fatalf("Failed to initialize MQTT: %v", err)
@@ -41,8 +48,33 @@ func main() {
 	}
 	defer services.LeakDetector.Close()
 
-	services.InitWebSocket()
-	defer services.WSService.Close()
+	alarmDataChan := make(chan models.ValidatedData, 1000)
+	leakDataChan := make(chan models.ValidatedData, 1000)
+	alarmChan := make(chan *models.Alarm, 100)
+	leakChan := make(chan *models.LeakSource, 100)
+
+	services.LaserReceiver = laser_receiver.NewLaserReceiver(&cfg.LaserReceiver)
+	services.LaserReceiver.SetChannels(alarmDataChan, leakDataChan)
+	services.LaserReceiver.Start()
+	defer services.LaserReceiver.Stop()
+
+	services.AlarmRouter = alarm_router.NewAlarmRouter(&cfg.AlarmRouter)
+	services.AlarmRouter.SetChannels(alarmDataChan, alarmChan)
+	services.AlarmRouter.SetSMSService(services.NewSMSService(&cfg.SMS))
+	services.AlarmRouter.Start()
+	defer services.AlarmRouter.Stop()
+
+	services.LeakLocator = leak_locator.NewLeakLocator(&cfg.LeakLocator)
+	services.LeakLocator.SetChannels(leakDataChan, leakChan)
+	if err := services.LeakLocator.Start(); err != nil {
+		log.Fatalf("Failed to start leak locator: %v", err)
+	}
+	defer services.LeakLocator.Stop()
+
+	services.EmergencyController = emergency_controller.NewEmergencyController(&cfg.EmergencyController)
+	services.EmergencyController.SetChannels(alarmChan, leakChan)
+	services.EmergencyController.Start()
+	defer services.EmergencyController.Stop()
 
 	r := api.SetupRouter()
 
@@ -54,6 +86,13 @@ func main() {
 			log.Fatalf("Failed to start server: %v", err)
 		}
 	}()
+
+	log.Println("=== 模块初始化完成 ===")
+	log.Printf("  LaserReceiver:    running=%v", services.LaserReceiver.IsRunning())
+	log.Printf("  AlarmRouter:      running=%v", services.AlarmRouter.IsRunning())
+	log.Printf("  LeakLocator:      running=%v", services.LeakLocator.IsRunning())
+	log.Printf("  EmergencyController: running=%v", services.EmergencyController.IsRunning())
+	log.Println("========================")
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)

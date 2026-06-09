@@ -21,6 +21,7 @@ func SetupRouter() *gin.Engine {
 		api.GET("/health", h.Health)
 		api.GET("/stats", h.GetStatistics)
 		api.GET("/wind", h.GetWindData)
+		api.GET("/receiver/stats", h.GetReceiverStats)
 
 		detectors := api.Group("/detectors")
 		{

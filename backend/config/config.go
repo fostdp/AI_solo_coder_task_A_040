@@ -3,18 +3,23 @@ package config
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/spf13/viper"
 )
 
 type Config struct {
-	Server        ServerConfig        `mapstructure:"server"`
-	Database      DatabaseConfig      `mapstructure:"database"`
-	MQTT          MQTTConfig          `mapstructure:"mqtt"`
-	Alarm         AlarmConfig         `mapstructure:"alarm"`
-	SMS           SMSConfig           `mapstructure:"sms"`
-	LeakDetection LeakDetectionConfig `mapstructure:"leak_detection"`
-	PipeCorridor  PipeCorridorConfig  `mapstructure:"pipe_corridor"`
+	Server             ServerConfig             `mapstructure:"server"`
+	Database           DatabaseConfig           `mapstructure:"database"`
+	MQTT               MQTTConfig               `mapstructure:"mqtt"`
+	Alarm              AlarmConfig              `mapstructure:"alarm"`
+	SMS                SMSConfig                `mapstructure:"sms"`
+	LeakDetection      LeakDetectionConfig      `mapstructure:"leak_detection"`
+	PipeCorridor       PipeCorridorConfig       `mapstructure:"pipe_corridor"`
+	LaserReceiver      LaserReceiverConfig      `mapstructure:"laser_receiver"`
+	LeakLocator        LeakLocatorConfig        `mapstructure:"leak_locator"`
+	EmergencyController EmergencyControllerConfig `mapstructure:"emergency_controller"`
+	AlarmRouter        AlarmRouterConfig        `mapstructure:"alarm_router"`
 }
 
 type ServerConfig struct {
@@ -109,4 +114,50 @@ func LoadConfig(configPath string) (*Config, error) {
 func (c *PostgreSQLConfig) DSN() string {
 	return fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
 		c.Host, c.Port, c.User, c.Password, c.DBName, c.SSLMode)
+}
+
+type LaserReceiverConfig struct {
+	MaxValidConcentration  float64       `mapstructure:"max_valid_concentration"`
+	MaxDataAge             time.Duration `mapstructure:"max_data_age"`
+	MaxFutureTime          time.Duration `mapstructure:"max_future_time"`
+	AlarmForwardThreshold  float64       `mapstructure:"alarm_forward_threshold"`
+	StatsInterval          time.Duration `mapstructure:"stats_interval"`
+}
+
+type LeakLocatorConfig struct {
+	DetectionInterval       time.Duration `mapstructure:"detection_interval"`
+	MaxReadingsPerDetector  int           `mapstructure:"max_readings_per_detector"`
+	HighConcentrationThreshold float64    `mapstructure:"high_concentration_threshold"`
+	MinHighConcReadings     int           `mapstructure:"min_high_conc_readings"`
+	AtmosphericStability    float64       `mapstructure:"atmospheric_stability"`
+	MinConfidence           float64       `mapstructure:"min_confidence"`
+	MinConfidenceDegraded   float64       `mapstructure:"min_confidence_degraded"`
+	LeakMergeDistance       float64       `mapstructure:"leak_merge_distance"`
+	PSONumParticles         int           `mapstructure:"pso_num_particles"`
+	PSOMaxIterations        int           `mapstructure:"pso_max_iterations"`
+	PSOInertiaWeight        float64       `mapstructure:"pso_inertia_weight"`
+	PSOCognitiveWeight      float64       `mapstructure:"pso_cognitive_weight"`
+	PSOSocialWeight         float64       `mapstructure:"pso_social_weight"`
+	SearchMinX              float64       `mapstructure:"search_min_x"`
+	SearchMaxX              float64       `mapstructure:"search_max_x"`
+	SearchMinRate           float64       `mapstructure:"search_min_rate"`
+	SearchMaxRate           float64       `mapstructure:"search_max_rate"`
+}
+
+type EmergencyControllerConfig struct {
+	ValveControlLevel    int           `mapstructure:"valve_control_level"`
+	EvacuationLevel      int           `mapstructure:"evacuation_level"`
+	FanSpeedNormal       int           `mapstructure:"fan_speed_normal"`
+	FanSpeedHigh         int           `mapstructure:"fan_speed_high"`
+	FanSpeedHighLevel    int           `mapstructure:"fan_speed_high_level"`
+	ControlCooldown      time.Duration `mapstructure:"control_cooldown"`
+}
+
+type AlarmRouterConfig struct {
+	Level1Threshold     float64       `mapstructure:"level1_threshold"`
+	Level2Threshold     float64       `mapstructure:"level2_threshold"`
+	Level3Threshold     float64       `mapstructure:"level3_threshold"`
+	SMSMinLevel         int           `mapstructure:"sms_min_level"`
+	SMSInterval         time.Duration `mapstructure:"sms_interval"`
+	SMSMaxPerInterval   int           `mapstructure:"sms_max_per_interval"`
 }

@@ -57,3 +57,45 @@ pipe_corridor:
   detector_interval: 100
   total_detectors: 300
   total_valves: 50
+
+laser_receiver:
+  max_valid_concentration: 100.0
+  max_data_age: 5s
+  max_future_time: 1s
+  alarm_forward_threshold: 1.0
+  stats_interval: 60s
+
+leak_locator:
+  detection_interval: 10s
+  max_readings_per_detector: 60
+  high_concentration_threshold: 10.0
+  min_high_conc_readings: 3
+  atmospheric_stability: 0.5
+  min_confidence: 50.0
+  min_confidence_degraded: 40.0
+  leak_merge_distance: 500.0
+  pso_num_particles: 50
+  pso_max_iterations: 100
+  pso_inertia_weight: 0.7
+  pso_cognitive_weight: 1.5
+  pso_social_weight: 1.5
+  search_min_x: 0.0
+  search_max_x: 30000.0
+  search_min_rate: 0.001
+  search_max_rate: 10.0
+
+emergency_controller:
+  valve_control_level: 2
+  evacuation_level: 3
+  fan_speed_normal: 75
+  fan_speed_high: 100
+  fan_speed_high_level: 3
+  control_cooldown: 5m
+
+alarm_router:
+  level1_threshold: 10.0
+  level2_threshold: 20.0
+  level3_threshold: 50.0
+  sms_min_level: 1
+  sms_interval: 15m
+  sms_max_per_interval: 3
