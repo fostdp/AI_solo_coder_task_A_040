@@ -1,0 +1,55 @@
+server:
+  port: 8080
+  host: 0.0.0.0
+
+database:
+  postgresql:
+    host: localhost
+    port: 5432
+    user: postgres
+    password: postgres
+    dbname: gas_monitoring
+    sslmode: disable
+  influxdb:
+    host: http://localhost:8086
+    token: your-token-here
+    org: smart-city
+    bucket: gas-data
+
+mqtt:
+  broker: tcp://localhost:1883
+  client_id: gas-monitoring-backend
+  username: admin
+  password: admin
+  topics:
+    sensor_data: "sensors/+/data"
+    valve_control: "valves/+/control"
+    alarm: "alarms/+"
+    command: "commands/#"
+
+alarm:
+  level1_threshold: 10.0
+  level2_threshold: 20.0
+  level3_threshold: 50.0
+  check_interval: 1
+
+sms:
+  api_url: "https://sms-api.example.com/send"
+  api_key: "your-sms-api-key"
+  receivers:
+    - "13800138000"
+    - "13900139000"
+
+leak_detection:
+  pso_particles: 50
+  pso_iterations: 100
+  pso_inertia_weight: 0.7
+  pso_cognitive_weight: 1.5
+  pso_social_weight: 1.5
+  diffusion_radius_base: 50.0
+
+pipe_corridor:
+  total_length: 30000
+  detector_interval: 100
+  total_detectors: 300
+  total_valves: 50

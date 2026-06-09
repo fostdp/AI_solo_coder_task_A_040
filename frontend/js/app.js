@@ -1,423 +1,504 @@
-let currentBlock = 'ALL';
-let refreshTimer = null;
+const App = (function() {
+    let detectors = [];
+    let alarms = [];
+    let leakSources = [];
+    let selectedDetector = null;
+    let refreshInterval = null;
 
-document.addEventListener('DOMContentLoaded', () => {
-    init();
-});
-
-async function init() {
-    MapManager.init();
-    setupEventListeners();
-    await loadBlocks();
-    await refreshAllData();
-    startAutoRefresh();
-    updateCurrentTime();
-    setInterval(updateCurrentTime, 1000);
-}
-
-function setupEventListeners() {
-    document.getElementById('block-selector').addEventListener('change', (e) => {
-        currentBlock = e.target.value;
-        MapManager.setBlock(currentBlock);
-        refreshCoreIndicators();
-    });
-
-    document.getElementById('show-injection').addEventListener('change', (e) => {
-        MapManager.setLayerVisibility('injection', e.target.checked);
-    });
-
-    document.getElementById('show-production').addEventListener('change', (e) => {
-        MapManager.setLayerVisibility('production', e.target.checked);
-    });
-
-    document.getElementById('show-relations').addEventListener('change', (e) => {
-        MapManager.setLayerVisibility('relations', e.target.checked);
-    });
-
-    document.getElementById('show-allocation').addEventListener('change', (e) => {
-        MapManager.setLayerVisibility('allocation', e.target.checked);
-    });
-}
-
-async function loadBlocks() {
-    try {
-        const data = await API.getBlocks();
-        const selector = document.getElementById('block-selector');
+    function init() {
+        console.log('初始化应用...');
         
-        for (const block of data.blocks || []) {
-            const option = document.createElement('option');
-            option.value = block;
-            option.textContent = block;
-            selector.appendChild(option);
-        }
-    } catch (error) {
-        console.error('Failed to load blocks:', error);
-    }
-}
-
-async function refreshAllData() {
-    await Promise.all([
-        MapManager.loadData(),
-        refreshCoreIndicators(),
-        refreshAlarms()
-    ]);
-}
-
-async function refreshCoreIndicators() {
-    try {
-        const data = await API.getCoreIndicators(currentBlock);
+        MapModule.init();
+        HeatmapModule.init();
         
-        document.getElementById('daily-oil').textContent = 
-            data.dailyOilProduction?.toFixed(2) || '--';
-        document.getElementById('daily-water').textContent = 
-            data.dailyWaterInjection?.toFixed(2) || '--';
-        document.getElementById('water-cut').textContent = 
-            data.comprehensiveWaterCut?.toFixed(2) || '--';
-
-        const changes = data.dayOverDayChanges || {};
+        setupEventListeners();
+        setupWebSocketCallbacks();
         
-        const oilChangeEl = document.getElementById('oil-change');
-        const waterChangeEl = document.getElementById('water-change');
-        const cutChangeEl = document.getElementById('cut-change');
-
-        updateChangeIndicator(oilChangeEl, changes.oilChange, true);
-        updateChangeIndicator(waterChangeEl, changes.waterChange, false);
-        updateChangeIndicator(cutChangeEl, changes.waterCutChange, false);
-
-    } catch (error) {
-        console.error('Failed to refresh core indicators:', error);
-    }
-}
-
-function updateChangeIndicator(element, value, isOil) {
-    if (value === undefined || value === null) {
-        element.textContent = '--';
-        element.className = 'indicator-change';
-        return;
+        loadInitialData();
+        
+        refreshInterval = setInterval(refreshData, 5000);
+        WebSocketModule.connect();
     }
 
-    const prefix = value >= 0 ? '+' : '';
-    element.textContent = `${prefix}${value.toFixed(2)}%`;
-    
-    if (isOil) {
-        element.className = value >= 0 ? 'indicator-change positive' : 'indicator-change negative';
-    } else {
-        element.className = value <= 0 ? 'indicator-change positive' : 'indicator-change negative';
-    }
-}
-
-async function refreshAlarms() {
-    try {
-        const data = await API.getAlarms();
+    function setupEventListeners() {
+        document.getElementById('btn-refresh').addEventListener('click', refreshData);
         
-        document.getElementById('alarm-badge').textContent = data.count || 0;
+        document.getElementById('btn-toggle-detectors').addEventListener('click', function() {
+            const visible = MapModule.toggleDetectors();
+            this.textContent = visible ? '隐藏检测器' : '显示检测器';
+        });
+
+        document.getElementById('btn-toggle-heatmap').addEventListener('click', function() {
+            const visible = HeatmapModule.toggle();
+            this.textContent = visible ? '隐藏热力图' : '显示热力图';
+        });
+
+        document.getElementById('btn-toggle-valves').addEventListener('click', function() {
+            const visible = MapModule.toggleValves();
+            this.textContent = visible ? '隐藏阀门' : '显示阀门';
+        });
+
+        document.getElementById('btn-toggle-leaks').addEventListener('click', function() {
+            const visible = MapModule.toggleLeaks();
+            this.textContent = visible ? '隐藏泄漏源' : '显示泄漏源';
+        });
+
+        document.getElementById('btn-acknowledge-alarm').addEventListener('click', acknowledgeSelectedAlarm);
+        document.getElementById('btn-close-modal').addEventListener('click', closeDetectorModal);
         
-        const alarmListEl = document.getElementById('alarm-list');
-        
-        if (!data.alarms || data.alarms.length === 0) {
-            alarmListEl.innerHTML = '<div class="no-data">暂无告警</div>';
-            return;
-        }
+        document.querySelector('.modal-overlay').addEventListener('click', function(e) {
+            if (e.target === this) {
+                closeDetectorModal();
+            }
+        });
 
-        alarmListEl.innerHTML = data.alarms.slice(0, 10).map(alarm => `
-            <div class="alarm-item level-${alarm.alarmLevel === 'LEVEL_1' ? '1' : '2'}" 
-                 onclick="handleAlarmClick(${alarm.id}, '${alarm.wellId}')">
-                <div class="alarm-type">${alarm.alarmLevel === 'LEVEL_1' ? '一级水淹预警' : '二级井筒异常'}</div>
-                <div class="alarm-message">${alarm.alarmMessage}</div>
-                <div class="alarm-time">${formatTime(alarm.alarmTime)}</div>
-            </div>
-        `).join('');
-
-    } catch (error) {
-        console.error('Failed to refresh alarms:', error);
-    }
-}
-
-function handleAlarmClick(alarmId, wellId) {
-    API.acknowledgeAlarm(alarmId).then(() => {
-        refreshAlarms();
-    });
-    
-    if (wellId) {
-        API.getWellById(wellId).then(well => {
-            if (well) {
-                MapManager.selectWell(well);
-                MapManager.map.flyTo([well.latitude, well.longitude], 14);
+        document.getElementById('alarm-list').addEventListener('click', function(e) {
+            const alarmItem = e.target.closest('.alarm-item');
+            if (alarmItem) {
+                const alarmId = alarmItem.dataset.alarmId;
+                focusOnAlarm(alarmId);
             }
         });
     }
-}
 
-async function showWellDetail(well) {
-    const panel = document.getElementById('detail-panel');
-    const titleEl = document.getElementById('detail-title');
-    const contentEl = document.getElementById('detail-content');
+    function setupWebSocketCallbacks() {
+        WebSocketModule.setOnConcentrationUpdate(function(data) {
+            updateDetectorConcentrations(data);
+        });
 
-    titleEl.textContent = `${well.wellName} - ${well.wellType === 'INJECTION' ? '注水井' : '采油井'}`;
-    panel.style.display = 'flex';
+        WebSocketModule.setOnAlarmUpdate(function(data) {
+            handleAlarmUpdate(data);
+        });
 
-    contentEl.innerHTML = `
-        <div class="well-info-grid">
-            <div class="info-item">
-                <div class="info-label">井号</div>
-                <div class="info-value">${well.wellId}</div>
-            </div>
-            <div class="info-item">
-                <div class="info-label">区块</div>
-                <div class="info-value">${well.blockName}</div>
-            </div>
-            <div class="info-item">
-                <div class="info-label">状态</div>
-                <div class="info-value">${well.status === 'ACTIVE' ? '正常' : '停用'}</div>
-            </div>
-            <div class="info-item">
-                <div class="info-label">经度</div>
-                <div class="info-value">${well.longitude?.toFixed(6) || '--'}</div>
-            </div>
-            <div class="info-item">
-                <div class="info-label">纬度</div>
-                <div class="info-value">${well.latitude?.toFixed(6) || '--'}</div>
-            </div>
-            ${well.wellType === 'INJECTION' ? `
-                <div class="info-item">
-                    <div class="info-label">设计压力</div>
-                    <div class="info-value">${well.designPressure?.toFixed(2) || '--'} MPa</div>
-                </div>
-                <div class="info-item">
-                    <div class="info-label">日注水量</div>
-                    <div class="info-value">${well.latestWaterVolume?.toFixed(2) || '--'} m³</div>
-                </div>
-                <div class="info-item">
-                    <div class="info-label">注水压力</div>
-                    <div class="info-value">${well.latestInjectionPressure?.toFixed(2) || '--'} MPa</div>
-                </div>
-            ` : `
-                <div class="info-item">
-                    <div class="info-label">日产油量</div>
-                    <div class="info-value">${well.latestOilVolume?.toFixed(2) || '--'} t</div>
-                </div>
-                <div class="info-item">
-                    <div class="info-label">含水率</div>
-                    <div class="info-value">${well.latestWaterCut?.toFixed(2) || '--'}%</div>
-                </div>
-            `}
-        </div>
+        WebSocketModule.setOnLeakSourceUpdate(function(data) {
+            handleLeakSourceUpdate(data);
+        });
 
-        <div class="chart-container">
-            <h4>近90天生产趋势</h4>
-            <div class="chart-wrapper">
-                <canvas id="trend-chart"></canvas>
-            </div>
-        </div>
-
-        <div class="chart-container">
-            <h4>注采对应分析</h4>
-            <div class="chart-wrapper">
-                <canvas id="relation-chart"></canvas>
-            </div>
-        </div>
-
-        <div id="allocation-section" style="${well.wellType === 'INJECTION' ? '' : 'display: none;'}">
-            <div class="chart-container">
-                <h4>最新调配建议</h4>
-                <div id="allocation-content">
-                    <div class="no-data">加载中...</div>
-                </div>
-            </div>
-        </div>
-
-        <div class="relation-analysis">
-            <h4>注采对应关系</h4>
-            <div id="relation-list">
-                <div class="no-data">加载中...</div>
-            </div>
-        </div>
-    `;
-
-    try {
-        const [trendData, relations, suggestions] = await Promise.all([
-            API.getWellTrend(well.wellId, 90),
-            API.getRelationsByWell(well.wellId, well.wellType),
-            well.wellType === 'INJECTION' ? API.getLatestSuggestions() : null
-        ]);
-
-        if (trendData) {
-            ChartManager.createProductionTrend('trend-chart', trendData);
-        }
-
-        if (well.wellType === 'INJECTION') {
-            const wellSuggestion = suggestions?.suggestions?.find(s => s.wellId === well.wellId);
-            renderAllocationSuggestion(wellSuggestion);
-        }
-
-        renderRelationAnalysis(relations, well.wellType);
-
-        const relatedWellTrend = await getRelatedWellTrend(well, relations);
-        if (relatedWellTrend) {
-            ChartManager.createInjectionProductionAnalysis('relation-chart', trendData, relatedWellTrend);
-        }
-
-    } catch (error) {
-        console.error('Failed to load well detail:', error);
-    }
-}
-
-function closeDetailPanel() {
-    document.getElementById('detail-panel').style.display = 'none';
-    MapManager.selectedWell = null;
-    MapManager.render();
-    ChartManager.destroyAll();
-}
-
-async function getRelatedWellTrend(well, relations) {
-    if (!relations || relations.length === 0) return null;
-
-    let relatedWellId = null;
-    if (well.wellType === 'INJECTION') {
-        relatedWellId = relations[0]?.productionWellId;
-    } else {
-        relatedWellId = relations[0]?.injectionWellId;
+        WebSocketModule.setOnStatusUpdate(function(data) {
+            console.log('WebSocket状态:', data);
+        });
     }
 
-    if (!relatedWellId) return null;
-
-    return await API.getWellTrend(relatedWellId, 90);
-}
-
-function renderAllocationSuggestion(suggestion) {
-    const contentEl = document.getElementById('allocation-content');
-    
-    if (!suggestion) {
-        contentEl.innerHTML = '<div class="no-data">暂无调配建议</div>';
-        return;
+    async function loadInitialData() {
+        try {
+            await Promise.all([
+                loadDetectors(),
+                loadActiveAlarms(),
+                loadLeakSources(),
+                loadStatistics()
+            ]);
+            
+            MapModule.loadPipeCorridor();
+            MapModule.addDetectorMarkers(detectors);
+            MapModule.addValveMarkers();
+            
+            HeatmapModule.updateHeatmap(detectors);
+            
+        } catch (error) {
+            console.error('加载初始数据失败:', error);
+            showNotification('加载数据失败，请刷新页面重试', 'error');
+        }
     }
 
-    contentEl.innerHTML = `
-        <div class="allocation-item">
-            <div class="allocation-header">
-                <span>建议日期: ${suggestion.suggestionDate}</span>
-                <span class="direction ${suggestion.adjustmentDirection}">
-                    ${suggestion.adjustmentDirection === 'INCREASE' ? '增加' : 
-                      suggestion.adjustmentDirection === 'DECREASE' ? '减少' : '保持'}
-                </span>
-            </div>
-            <div style="display: flex; gap: 20px; margin-bottom: 8px;">
-                <div>
-                    <div class="info-label">当前注水量</div>
-                    <div class="info-value">${suggestion.currentWaterVolume.toFixed(2)} m³</div>
-                </div>
-                <div>
-                    <div class="info-label">建议注水量</div>
-                    <div class="info-value">${suggestion.suggestedWaterVolume.toFixed(2)} m³</div>
-                </div>
-                <div>
-                    <div class="info-label">调整量</div>
-                    <div class="info-value" style="color: ${
-                        suggestion.adjustmentAmount > 0 ? '#4caf50' : 
-                        suggestion.adjustmentAmount < 0 ? '#f44336' : '#9e9e9e'
-                    }">
-                        ${suggestion.adjustmentAmount > 0 ? '+' : ''}${suggestion.adjustmentAmount.toFixed(2)} m³
+    async function loadDetectors() {
+        try {
+            const response = await fetch(`${Config.API_URL}/detectors`);
+            if (!response.ok) throw new Error('获取检测器列表失败');
+            detectors = await response.json();
+            return detectors;
+        } catch (error) {
+            console.error('加载检测器失败:', error);
+            throw error;
+        }
+    }
+
+    async function loadActiveAlarms() {
+        try {
+            const response = await fetch(`${Config.API_URL}/alarms/active`);
+            if (!response.ok) throw new Error('获取活动告警失败');
+            alarms = await response.json();
+            updateAlarmList();
+            return alarms;
+        } catch (error) {
+            console.error('加载活动告警失败:', error);
+            throw error;
+        }
+    }
+
+    async function loadLeakSources() {
+        try {
+            const response = await fetch(`${Config.API_URL}/leaks/active`);
+            if (!response.ok) throw new Error('获取泄漏源失败');
+            leakSources = await response.json();
+            MapModule.updateLeakMarkers(leakSources);
+            return leakSources;
+        } catch (error) {
+            console.error('加载泄漏源失败:', error);
+            throw error;
+        }
+    }
+
+    async function loadStatistics() {
+        try {
+            const response = await fetch(`${Config.API_URL}/statistics`);
+            if (!response.ok) throw new Error('获取统计数据失败');
+            const stats = await response.json();
+            updateStatistics(stats);
+            return stats;
+        } catch (error) {
+            console.error('加载统计数据失败:', error);
+            throw error;
+        }
+    }
+
+    async function refreshData() {
+        try {
+            await Promise.all([
+                loadDetectors().then(() => {
+                    MapModule.updateDetectorMarkers(detectors);
+                    HeatmapModule.updateHeatmap(detectors);
+                }),
+                loadActiveAlarms(),
+                loadLeakSources(),
+                loadStatistics()
+            ]);
+            
+            if (selectedDetector) {
+                refreshDetectorDetail(selectedDetector.id);
+            }
+        } catch (error) {
+            console.error('刷新数据失败:', error);
+        }
+    }
+
+    function updateDetectorConcentrations(data) {
+        if (!Array.isArray(data)) return;
+        
+        data.forEach(update => {
+            const detector = detectors.find(d => d.id === update.detector_id);
+            if (detector) {
+                detector.current_concentration = update.concentration;
+                detector.last_update = update.timestamp;
+            }
+        });
+        
+        MapModule.updateDetectorMarkers(detectors);
+        HeatmapModule.updateHeatmap(detectors);
+    }
+
+    function handleAlarmUpdate(data) {
+        if (data.action === 'new') {
+            alarms.push(data.alarm);
+            updateAlarmList();
+            showAlarmNotification(data.alarm);
+        } else if (data.action === 'update') {
+            const index = alarms.findIndex(a => a.id === data.alarm.id);
+            if (index !== -1) {
+                alarms[index] = data.alarm;
+                updateAlarmList();
+            }
+        } else if (data.action === 'resolve') {
+            alarms = alarms.filter(a => a.id !== data.alarm_id);
+            updateAlarmList();
+        }
+        
+        loadStatistics();
+    }
+
+    function handleLeakSourceUpdate(data) {
+        if (data.action === 'new' || data.action === 'update') {
+            const existing = leakSources.find(l => l.id === data.leak_source.id);
+            if (existing) {
+                Object.assign(existing, data.leak_source);
+            } else {
+                leakSources.push(data.leak_source);
+            }
+        } else if (data.action === 'resolve') {
+            leakSources = leakSources.filter(l => l.id !== data.leak_source_id);
+        }
+        MapModule.updateLeakMarkers(leakSources);
+    }
+
+    function updateAlarmList() {
+        const listEl = document.getElementById('alarm-list');
+        const countEl = document.getElementById('alarm-count');
+        
+        countEl.textContent = alarms.length;
+        
+        if (alarms.length === 0) {
+            listEl.innerHTML = '<div class="no-alarms">暂无活动告警</div>';
+            return;
+        }
+
+        const sortedAlarms = [...alarms].sort((a, b) => {
+            const levelPriority = { 'level3': 0, 'level2': 1, 'level1': 2 };
+            return levelPriority[a.level] - levelPriority[b.level];
+        });
+
+        listEl.innerHTML = sortedAlarms.map(alarm => {
+            const levelClass = `alarm-${alarm.level}`;
+            const levelText = {
+                'level1': '一级预警',
+                'level2': '二级报警',
+                'level3': '三级紧急'
+            }[alarm.level] || alarm.level;
+            
+            const time = new Date(alarm.timestamp * 1000);
+            const timeStr = `${time.getHours().toString().padStart(2, '0')}:${time.getMinutes().toString().padStart(2, '0')}:${time.getSeconds().toString().padStart(2, '0')}`;
+
+            return `
+                <div class="alarm-item ${levelClass}" data-alarm-id="${alarm.id}">
+                    <div class="alarm-header">
+                        <span class="alarm-level">${levelText}</span>
+                        <span class="alarm-time">${timeStr}</span>
+                    </div>
+                    <div class="alarm-content">
+                        <div class="alarm-device">检测器: ${alarm.detector_id}</div>
+                        <div class="alarm-value">浓度: ${alarm.concentration.toFixed(2)}%LEL</div>
+                        <div class="alarm-message">${alarm.message || '燃气浓度超标'}</div>
                     </div>
                 </div>
-            </div>
-            <div class="reason">${suggestion.reason || '暂无详细说明'}</div>
-        </div>
-    `;
-}
-
-function renderRelationAnalysis(relations, wellType) {
-    const listEl = document.getElementById('relation-list');
-    
-    if (!relations || relations.length === 0) {
-        listEl.innerHTML = '<div class="no-data">暂无注采对应关系</div>';
-        return;
+            `;
+        }).join('');
     }
 
-    const getEffectivenessClass = (type) => {
-        switch (type) {
-            case 'HIGH': return 'high';
-            case 'MEDIUM': return 'medium';
-            case 'LOW': return 'low';
-            default: return '';
+    function updateStatistics(stats) {
+        document.getElementById('stat-total-detectors').textContent = stats.total_detectors || 0;
+        document.getElementById('stat-online-detectors').textContent = stats.online_detectors || 0;
+        document.getElementById('stat-active-alarms').textContent = stats.active_alarms || 0;
+        document.getElementById('stat-leak-sources').textContent = stats.active_leak_sources || 0;
+        
+        const avgConcentration = stats.avg_concentration || 0;
+        document.getElementById('stat-avg-concentration').textContent = avgConcentration.toFixed(2) + '%LEL';
+        
+        const maxConcentration = stats.max_concentration || 0;
+        const maxEl = document.getElementById('stat-max-concentration');
+        maxEl.textContent = maxConcentration.toFixed(2) + '%LEL';
+        
+        if (maxConcentration >= Config.ALARM_LEVEL3) {
+            maxEl.className = 'stat-value critical';
+        } else if (maxConcentration >= Config.ALARM_LEVEL2) {
+            maxEl.className = 'stat-value warning';
+        } else if (maxConcentration >= Config.ALARM_LEVEL1) {
+            maxEl.className = 'stat-value caution';
+        } else {
+            maxEl.className = 'stat-value';
         }
-    };
+    }
 
-    const getEffectivenessText = (type) => {
-        switch (type) {
-            case 'HIGH': return '高效';
-            case 'MEDIUM': return '中等';
-            case 'LOW': return '无效';
-            default: return '未知';
+    function showAlarmNotification(alarm) {
+        const levelText = {
+            'level1': '一级预警',
+            'level2': '二级报警',
+            'level3': '三级紧急'
+        }[alarm.level] || alarm.level;
+
+        const message = `${levelText}: 检测器 ${alarm.detector_id} 浓度 ${alarm.concentration.toFixed(2)}%LEL`;
+        showNotification(message, alarm.level);
+
+        if (alarm.level === 'level3') {
+            playAlarmSound();
         }
-    };
+    }
 
-    listEl.innerHTML = relations.slice(0, 8).map(rel => {
-        const relatedWellId = wellType === 'INJECTION' ? rel.productionWellId : rel.injectionWellId;
-        return `
-            <div class="relation-item ${getEffectivenessClass(rel.effectivenessType)}">
-                <span class="well-name">${relatedWellId}</span>
-                <span class="effectiveness">
-                    ${getEffectivenessText(rel.effectivenessType)}
-                    ${rel.effectivenessDegree ? `(${rel.effectivenessDegree.toFixed(1)}%)` : ''}
-                </span>
-            </div>
+    function showNotification(message, type = 'info') {
+        const container = document.getElementById('notification-container');
+        const notification = document.createElement('div');
+        notification.className = `notification notification-${type}`;
+        notification.innerHTML = `
+            <span class="notification-message">${message}</span>
+            <button class="notification-close">&times;</button>
         `;
-    }).join('');
-}
+        
+        container.appendChild(notification);
+        
+        notification.querySelector('.notification-close').addEventListener('click', () => {
+            notification.remove();
+        });
+        
+        setTimeout(() => {
+            if (notification.parentNode) {
+                notification.remove();
+            }
+        }, 8000);
+    }
 
-async function runAllocation() {
-    if (confirm('确定要立即生成注水调配建议吗？此过程可能需要几秒钟。')) {
+    function playAlarmSound() {
         try {
-            await API.runAllocation();
-            await MapManager.loadData();
-            alert('调配建议生成成功！');
-        } catch (error) {
-            console.error('Failed to run allocation:', error);
-            alert('调配建议生成失败，请检查后端服务。');
+            const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            const oscillator = audioContext.createOscillator();
+            const gainNode = audioContext.createGain();
+            
+            oscillator.connect(gainNode);
+            gainNode.connect(audioContext.destination);
+            
+            oscillator.frequency.value = 800;
+            oscillator.type = 'square';
+            gainNode.gain.value = 0.3;
+            
+            oscillator.start();
+            setTimeout(() => oscillator.stop(), 500);
+        } catch (e) {
+            console.log('无法播放告警声音:', e);
         }
     }
-}
 
-async function checkAlarms() {
-    try {
-        await API.checkAlarms();
-        await refreshAlarms();
-        alert('告警检查完成！');
-    } catch (error) {
-        console.error('Failed to check alarms:', error);
-        alert('告警检查失败，请检查后端服务。');
+    async function showDetectorDetail(detectorId) {
+        const detector = detectors.find(d => d.id === detectorId);
+        if (!detector) return;
+        
+        selectedDetector = detector;
+        
+        try {
+            const [historyData, healthData] = await Promise.all([
+                fetch(`${Config.API_URL}/detectors/${detectorId}/history?hours=1`).then(r => r.json()),
+                fetch(`${Config.API_URL}/detectors/${detectorId}/health`).then(r => r.json())
+            ]);
+            
+            document.getElementById('modal-detector-id').textContent = detector.id;
+            document.getElementById('modal-detector-position').textContent = `里程: ${detector.position_meters}米`;
+            document.getElementById('modal-detector-zone').textContent = `防火分区: ${detector.fire_zone_id || '未知'}`;
+            document.getElementById('modal-current-concentration').textContent = 
+                (detector.current_concentration || 0).toFixed(2) + '%LEL';
+            
+            const statusText = document.getElementById('modal-detector-status');
+            const statusClass = getStatusClass(detector.current_concentration || 0);
+            statusText.textContent = statusClass.text;
+            statusText.className = `status-badge ${statusClass.class}`;
+            
+            ChartModule.drawConcentrationChart('concentration-chart', historyData);
+            ChartModule.drawHealthIndicator('health-indicator', healthData.status);
+            
+            document.getElementById('health-status').textContent = healthData.status === 'normal' ? '正常' :
+                healthData.status === 'warning' ? '警告' :
+                healthData.status === 'error' ? '故障' : '离线';
+            document.getElementById('health-last-check').textContent = 
+                new Date(healthData.last_check * 1000).toLocaleString('zh-CN');
+            document.getElementById('health-uptime').textContent = formatUptime(healthData.uptime_seconds || 0);
+            document.getElementById('health-temp').textContent = healthData.temperature ? 
+                healthData.temperature.toFixed(1) + '°C' : 'N/A';
+            document.getElementById('health-voltage').textContent = healthData.voltage ? 
+                healthData.voltage.toFixed(2) + 'V' : 'N/A';
+            document.getElementById('health-signal').textContent = healthData.signal_strength ? 
+                healthData.signal_strength + '%' : 'N/A';
+            
+            document.getElementById('detector-modal').style.display = 'block';
+            
+        } catch (error) {
+            console.error('加载检测器详情失败:', error);
+            showNotification('加载检测器详情失败', 'error');
+        }
     }
-}
 
-function startAutoRefresh() {
-    if (refreshTimer) {
-        clearInterval(refreshTimer);
+    async function refreshDetectorDetail(detectorId) {
+        if (!selectedDetector || selectedDetector.id !== detectorId) return;
+        
+        try {
+            const [historyData, healthData] = await Promise.all([
+                fetch(`${Config.API_URL}/detectors/${detectorId}/history?hours=1`).then(r => r.json()),
+                fetch(`${Config.API_URL}/detectors/${detectorId}/health`).then(r => r.json())
+            ]);
+            
+            const detector = detectors.find(d => d.id === detectorId);
+            if (detector) {
+                document.getElementById('modal-current-concentration').textContent = 
+                    (detector.current_concentration || 0).toFixed(2) + '%LEL';
+                
+                const statusClass = getStatusClass(detector.current_concentration || 0);
+                const statusText = document.getElementById('modal-detector-status');
+                statusText.textContent = statusClass.text;
+                statusText.className = `status-badge ${statusClass.class}`;
+            }
+            
+            ChartModule.drawConcentrationChart('concentration-chart', historyData);
+            ChartModule.drawHealthIndicator('health-indicator', healthData.status);
+            
+        } catch (error) {
+            console.error('刷新检测器详情失败:', error);
+        }
     }
-    refreshTimer = setInterval(() => {
-        refreshAllData();
-    }, CONFIG.REFRESH_INTERVAL);
-}
 
-function updateCurrentTime() {
-    const now = new Date();
-    const timeStr = now.toLocaleString('zh-CN', {
-        year: 'numeric',
-        month: '2-digit',
-        day: '2-digit',
-        hour: '2-digit',
-        minute: '2-digit',
-        second: '2-digit'
-    });
-    document.getElementById('current-time').textContent = timeStr;
-}
+    function closeDetectorModal() {
+        document.getElementById('detector-modal').style.display = 'none';
+        selectedDetector = null;
+    }
 
-function formatTime(timeStr) {
-    if (!timeStr) return '--';
-    const date = new Date(timeStr);
-    return date.toLocaleString('zh-CN', {
-        month: '2-digit',
-        day: '2-digit',
-        hour: '2-digit',
-        minute: '2-digit'
-    });
-}
+    function getStatusClass(concentration) {
+        if (concentration >= Config.ALARM_LEVEL3) {
+            return { text: '三级紧急', class: 'status-danger' };
+        } else if (concentration >= Config.ALARM_LEVEL2) {
+            return { text: '二级报警', class: 'status-warning' };
+        } else if (concentration >= Config.ALARM_LEVEL1) {
+            return { text: '一级预警', class: 'status-caution' };
+        } else {
+            return { text: '正常', class: 'status-normal' };
+        }
+    }
+
+    function formatUptime(seconds) {
+        const days = Math.floor(seconds / 86400);
+        const hours = Math.floor((seconds % 86400) / 3600);
+        const minutes = Math.floor((seconds % 3600) / 60);
+        
+        if (days > 0) {
+            return `${days}天${hours}小时${minutes}分钟`;
+        } else if (hours > 0) {
+            return `${hours}小时${minutes}分钟`;
+        } else {
+            return `${minutes}分钟`;
+        }
+    }
+
+    function focusOnAlarm(alarmId) {
+        const alarm = alarms.find(a => a.id === alarmId);
+        if (alarm && alarm.detector_id) {
+            const detector = detectors.find(d => d.id === alarm.detector_id);
+            if (detector && detector.latitude && detector.longitude) {
+                window.map.setView([detector.latitude, detector.longitude], 15);
+                showDetectorDetail(alarm.detector_id);
+            }
+        }
+    }
+
+    async function acknowledgeSelectedAlarm() {
+        const checkboxes = document.querySelectorAll('.alarm-item input[type="checkbox"]:checked');
+        if (checkboxes.length === 0) {
+            showNotification('请先选择要确认的告警', 'info');
+            return;
+        }
+
+        for (const checkbox of checkboxes) {
+            const alarmId = checkbox.closest('.alarm-item').dataset.alarmId;
+            try {
+                await fetch(`${Config.API_URL}/alarms/${alarmId}/acknowledge`, {
+                    method: 'POST'
+                });
+            } catch (error) {
+                console.error('确认告警失败:', error);
+            }
+        }
+        
+        loadActiveAlarms();
+        showNotification(`已确认 ${checkboxes.length} 条告警`, 'success');
+    }
+
+    function getDetectors() {
+        return detectors;
+    }
+
+    function getSelectedDetector() {
+        return selectedDetector;
+    }
+
+    return {
+        init: init,
+        showDetectorDetail: showDetectorDetail,
+        getDetectors: getDetectors,
+        getSelectedDetector: getSelectedDetector,
+        refreshData: refreshData
+    };
+})();
+
+document.addEventListener('DOMContentLoaded', function() {
+    App.init();
+});

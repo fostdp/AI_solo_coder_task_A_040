@@ -1,337 +1,428 @@
-const MapManager = {
-    map: null,
-    canvas: null,
-    ctx: null,
-    wells: [],
-    relations: [],
-    suggestions: [],
-    selectedWell: null,
-    layerVisibility: {
-        injection: true,
-        production: true,
-        relations: true,
-        allocation: true
-    },
-    currentBlock: 'ALL',
+const MapModule = (function() {
+    let detectorMarkers = {};
+    let valveMarkers = {};
+    let leakMarkers = {};
+    let leakCircles = {};
+    let pipeCorridorLayer = null;
+    let detectorsVisible = true;
+    let valvesVisible = true;
+    let leaksVisible = true;
 
-    init() {
-        this.map = L.map('map', {
-            center: CONFIG.MAP_CENTER,
-            zoom: CONFIG.MAP_ZOOM,
+    function init() {
+        window.map = L.map('map', {
+            center: Config.MAP_CENTER,
+            zoom: Config.MAP_ZOOM,
+            preferCanvas: true,
             zoomControl: true,
             attributionControl: true
         });
 
         L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
             attribution: '© OpenStreetMap contributors',
-            maxZoom: 18
-        }).addTo(this.map);
+            maxZoom: 19,
+            className: 'map-tiles'
+        }).addTo(window.map);
+    }
 
-        this.canvas = document.getElementById('well-canvas');
-        this.ctx = this.canvas.getContext('2d');
-
-        this.resizeCanvas();
-        window.addEventListener('resize', () => this.resizeCanvas());
-
-        this.map.on('moveend', () => this.render());
-        this.map.on('zoomend', () => this.render());
-        this.map.on('resize', () => this.resizeCanvas());
-
-        this.setupCanvasInteraction();
-
-        this.render();
-    },
-
-    resizeCanvas() {
-        const container = document.querySelector('.map-container');
-        this.canvas.width = container.clientWidth;
-        this.canvas.height = container.clientHeight;
-        this.render();
-    },
-
-    setupCanvasInteraction() {
-        const mapContainer = document.getElementById('map');
-        
-        mapContainer.addEventListener('click', (e) => {
-            const rect = this.canvas.getBoundingClientRect();
-            const x = e.clientX - rect.left;
-            const y = e.clientY - rect.top;
-            
-            const clickedWell = this.findWellAtPosition(x, y);
-            if (clickedWell) {
-                this.selectWell(clickedWell);
-            }
-        });
-
-        mapContainer.addEventListener('mousemove', (e) => {
-            const rect = this.canvas.getBoundingClientRect();
-            const x = e.clientX - rect.left;
-            const y = e.clientY - rect.top;
-            
-            const hoveredWell = this.findWellAtPosition(x, y);
-            this.showTooltip(hoveredWell, e.clientX, e.clientY);
-            
-            mapContainer.style.cursor = hoveredWell ? 'pointer' : 'grab';
-        });
-
-        mapContainer.addEventListener('mouseleave', () => {
-            this.hideTooltip();
-        });
-    },
-
-    findWellAtPosition(x, y) {
-        for (let i = this.wells.length - 1; i >= 0; i--) {
-            const well = this.wells[i];
-            const point = this.map.latLngToContainerPoint([well.latitude, well.longitude]);
-            
-            const dx = x - point.x;
-            const dy = y - point.y;
-            const distance = Math.sqrt(dx * dx + dy * dy);
-            
-            if (distance <= CONFIG.WELL_RADIUS + 4) {
-                return well;
-            }
-        }
-        return null;
-    },
-
-    selectWell(well) {
-        this.selectedWell = well;
-        showWellDetail(well);
-        this.render();
-    },
-
-    showTooltip(well, clientX, clientY) {
-        let tooltip = document.getElementById('well-tooltip');
-        
-        if (!well) {
-            this.hideTooltip();
-            return;
-        }
-
-        if (!tooltip) {
-            tooltip = document.createElement('div');
-            tooltip.id = 'well-tooltip';
-            tooltip.className = 'tooltip';
-            document.body.appendChild(tooltip);
-        }
-
-        let content = `<div class="tooltip-title">${well.wellName}</div>`;
-        content += `<div class="tooltip-row"><span class="tooltip-label">类型:</span><span class="tooltip-value">${well.wellType === 'INJECTION' ? '注水井' : '采油井'}</span></div>`;
-        content += `<div class="tooltip-row"><span class="tooltip-label">区块:</span><span class="tooltip-value">${well.blockName}</span></div>`;
-
-        if (well.wellType === 'INJECTION') {
-            content += `<div class="tooltip-row"><span class="tooltip-label">日注水量:</span><span class="tooltip-value">${well.latestWaterVolume?.toFixed(2) || '--'} m³</span></div>`;
-            content += `<div class="tooltip-row"><span class="tooltip-label">注水压力:</span><span class="tooltip-value">${well.latestInjectionPressure?.toFixed(2) || '--'} MPa</span></div>`;
-        } else {
-            content += `<div class="tooltip-row"><span class="tooltip-label">日产油量:</span><span class="tooltip-value">${well.latestOilVolume?.toFixed(2) || '--'} t</span></div>`;
-            content += `<div class="tooltip-row"><span class="tooltip-label">含水率:</span><span class="tooltip-value">${well.latestWaterCut?.toFixed(2) || '--'}%</span></div>`;
-        }
-
-        tooltip.innerHTML = content;
-        tooltip.style.left = (clientX + 15) + 'px';
-        tooltip.style.top = (clientY + 15) + 'px';
-        tooltip.style.display = 'block';
-    },
-
-    hideTooltip() {
-        const tooltip = document.getElementById('well-tooltip');
-        if (tooltip) {
-            tooltip.style.display = 'none';
-        }
-    },
-
-    async loadData() {
+    async function loadPipeCorridor() {
         try {
-            const [wells, relations, suggestions] = await Promise.all([
-                API.getWells(null, this.currentBlock),
-                API.getRelations(this.currentBlock),
-                API.getLatestSuggestions()
-            ]);
-
-            this.wells = wells;
-            this.relations = relations.lines || [];
-            this.suggestions = suggestions.suggestions || [];
-
-            this.render();
-        } catch (error) {
-            console.error('Failed to load map data:', error);
-        }
-    },
-
-    setBlock(blockName) {
-        this.currentBlock = blockName;
-        this.loadData();
-    },
-
-    setLayerVisibility(layer, visible) {
-        this.layerVisibility[layer] = visible;
-        this.render();
-    },
-
-    render() {
-        if (!this.ctx || !this.map) return;
-
-        this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
-
-        if (this.layerVisibility.relations) {
-            this.renderRelations();
-        }
-
-        if (this.layerVisibility.allocation) {
-            this.renderAllocationArrows();
-        }
-
-        if (this.layerVisibility.injection) {
-            this.renderWells('INJECTION');
-        }
-
-        if (this.layerVisibility.production) {
-            this.renderWells('PRODUCTION');
-        }
-    },
-
-    renderRelations() {
-        this.ctx.lineWidth = 2;
-        this.ctx.globalAlpha = 0.6;
-
-        for (const relation of this.relations) {
-            const coords = relation.coordinates;
-            if (!coords || coords.length < 2) continue;
-
-            const start = this.map.latLngToContainerPoint([coords[0][1], coords[0][0]]);
-            const end = this.map.latLngToContainerPoint([coords[1][1], coords[1][0]]);
-
-            this.ctx.beginPath();
-            this.ctx.moveTo(start.x, start.y);
-            this.ctx.lineTo(end.x, end.y);
-            this.ctx.strokeStyle = relation.color || '#888';
-            this.ctx.stroke();
-
-            this.drawArrowHead(start, end, relation.color);
-        }
-
-        this.ctx.globalAlpha = 1;
-    },
-
-    drawArrowHead(start, end, color) {
-        const headLength = 8;
-        const angle = Math.atan2(end.y - start.y, end.x - start.x);
-
-        this.ctx.beginPath();
-        this.ctx.moveTo(end.x, end.y);
-        this.ctx.lineTo(
-            end.x - headLength * Math.cos(angle - Math.PI / 6),
-            end.y - headLength * Math.sin(angle - Math.PI / 6)
-        );
-        this.ctx.moveTo(end.x, end.y);
-        this.ctx.lineTo(
-            end.x - headLength * Math.cos(angle + Math.PI / 6),
-            end.y - headLength * Math.sin(angle + Math.PI / 6)
-        );
-        this.ctx.strokeStyle = color;
-        this.ctx.stroke();
-    },
-
-    renderWells(type) {
-        const filteredWells = this.wells.filter(w => w.wellType === type);
-
-        for (const well of filteredWells) {
-            const point = this.map.latLngToContainerPoint([well.latitude, well.longitude]);
+            const response = await fetch(`${Config.API_URL}/pipe-corridor`);
+            if (!response.ok) throw new Error('获取管廊路径失败');
+            const data = await response.json();
             
-            const isSelected = this.selectedWell && this.selectedWell.wellId === well.wellId;
-            const radius = isSelected ? CONFIG.WELL_RADIUS + 4 : CONFIG.WELL_RADIUS;
+            if (data.length > 0) {
+                const latlngs = data.map(p => [p.latitude, p.longitude]);
 
-            if (type === 'INJECTION') {
-                this.drawInjectionWell(point.x, point.y, radius, isSelected, well);
-            } else {
-                this.drawProductionWell(point.x, point.y, radius, isSelected, well);
+                if (pipeCorridorLayer) {
+                    window.map.removeLayer(pipeCorridorLayer);
+                }
+
+                const boundary = L.polyline(latlngs, {
+                    color: '#1e40af',
+                    weight: 10,
+                    opacity: 0.3,
+                    lineJoin: 'round',
+                    lineCap: 'round'
+                }).addTo(window.map);
+
+                pipeCorridorLayer = L.polyline(latlngs, {
+                    color: '#3b82f6',
+                    weight: 6,
+                    opacity: 0.8,
+                    lineJoin: 'round',
+                    lineCap: 'round'
+                }).addTo(window.map);
+
+                pipeCorridorLayer.bringToFront();
+
+                const bounds = L.latLngBounds(latlngs);
+                window.map.fitBounds(bounds, { padding: [50, 50] });
             }
-        }
-    },
-
-    drawInjectionWell(x, y, radius, isSelected, well) {
-        const gradient = this.ctx.createRadialGradient(x, y, 0, x, y, radius);
-        gradient.addColorStop(0, CONFIG.COLORS.INJECTION);
-        gradient.addColorStop(1, '#1565c0');
-
-        this.ctx.beginPath();
-        this.ctx.arc(x, y, radius, 0, Math.PI * 2);
-        this.ctx.fillStyle = gradient;
-        this.ctx.fill();
-
-        this.ctx.strokeStyle = isSelected ? '#ffeb3b' : CONFIG.COLORS.INJECTION_STROKE;
-        this.ctx.lineWidth = isSelected ? 3 : 2;
-        this.ctx.stroke();
-
-        this.ctx.fillStyle = '#fff';
-        this.ctx.font = 'bold 10px Arial';
-        this.ctx.textAlign = 'center';
-        this.ctx.textBaseline = 'middle';
-        this.ctx.fillText('注', x, y);
-    },
-
-    drawProductionWell(x, y, radius, isSelected, well) {
-        this.ctx.beginPath();
-        this.ctx.moveTo(x, y - radius);
-        this.ctx.lineTo(x - radius, y + radius * 0.8);
-        this.ctx.lineTo(x + radius, y + radius * 0.8);
-        this.ctx.closePath();
-
-        const gradient = this.ctx.createLinearGradient(x, y - radius, x, y + radius);
-        gradient.addColorStop(0, CONFIG.COLORS.PRODUCTION);
-        gradient.addColorStop(1, '#c62828');
-
-        this.ctx.fillStyle = gradient;
-        this.ctx.fill();
-
-        this.ctx.strokeStyle = isSelected ? '#ffeb3b' : CONFIG.COLORS.PRODUCTION_STROKE;
-        this.ctx.lineWidth = isSelected ? 3 : 2;
-        this.ctx.stroke();
-
-        this.ctx.fillStyle = '#fff';
-        this.ctx.font = 'bold 9px Arial';
-        this.ctx.textAlign = 'center';
-        this.ctx.textBaseline = 'middle';
-        this.ctx.fillText('采', x, y + 2);
-    },
-
-    renderAllocationArrows() {
-        for (const suggestion of this.suggestions) {
-            if (suggestion.adjustmentDirection === 'KEEP') continue;
-
-            const well = this.wells.find(w => w.wellId === suggestion.wellId);
-            if (!well) continue;
-
-            const point = this.map.latLngToContainerPoint([well.latitude, well.longitude]);
-            
-            const isIncrease = suggestion.adjustmentDirection === 'INCREASE';
-            const arrowLength = 20 + Math.min(Math.abs(suggestion.adjustmentAmount) / 2, 20);
-            const direction = isIncrease ? -1 : 1;
-
-            this.ctx.beginPath();
-            this.ctx.moveTo(point.x, point.y - CONFIG.WELL_RADIUS - 5);
-            this.ctx.lineTo(point.x, point.y - CONFIG.WELL_RADIUS - 5 - arrowLength * direction);
-            this.ctx.strokeStyle = isIncrease ? CONFIG.COLORS.ALLOCATION_INCREASE : CONFIG.COLORS.ALLOCATION_DECREASE;
-            this.ctx.lineWidth = 3;
-            this.ctx.stroke();
-
-            const arrowHeadSize = 6;
-            const arrowY = point.y - CONFIG.WELL_RADIUS - 5 - arrowLength * direction;
-            
-            this.ctx.beginPath();
-            this.ctx.moveTo(point.x, arrowY);
-            this.ctx.lineTo(point.x - arrowHeadSize, arrowY + arrowHeadSize * direction);
-            this.ctx.lineTo(point.x + arrowHeadSize, arrowY + arrowHeadSize * direction);
-            this.ctx.closePath();
-            this.ctx.fillStyle = isIncrease ? CONFIG.COLORS.ALLOCATION_INCREASE : CONFIG.COLORS.ALLOCATION_DECREASE;
-            this.ctx.fill();
-
-            this.ctx.fillStyle = isIncrease ? CONFIG.COLORS.ALLOCATION_INCREASE : CONFIG.COLORS.ALLOCATION_DECREASE;
-            this.ctx.font = 'bold 11px Arial';
-            this.ctx.textAlign = 'center';
-            const labelY = arrowY - (isIncrease ? 8 : -8);
-            this.ctx.fillText((isIncrease ? '+' : '') + suggestion.adjustmentAmount.toFixed(1), point.x, labelY);
+        } catch (error) {
+            console.error('加载管廊路径失败:', error);
         }
     }
-};
+
+    function addDetectorMarkers(detectors) {
+        clearDetectorMarkers();
+        
+        detectors.forEach(detector => {
+            if (detector.latitude && detector.longitude) {
+                addDetectorMarker(detector);
+            }
+        });
+    }
+
+    function addDetectorMarker(detector) {
+        const concentration = detector.current_concentration || 0;
+        const color = getConcentrationColor(concentration);
+        const isAlarm = concentration >= Config.ALARM_LEVEL1;
+
+        const icon = L.divIcon({
+            className: 'custom-marker',
+            html: `<div class="detector-marker ${isAlarm ? 'alarm' : ''}" style="background: ${color};"></div>`,
+            iconSize: [16, 16],
+            iconAnchor: [8, 8]
+        });
+
+        const marker = L.marker([detector.latitude, detector.longitude], {
+            icon: icon,
+            title: detector.id
+        });
+
+        marker.bindTooltip(`
+            <div class="tooltip-content">
+                <strong>检测器 ${detector.id}</strong><br>
+                <span style="color: ${color}; font-weight: bold;">${concentration.toFixed(2)}% LEL</span><br>
+                <span style="font-size: 11px; color: #6b7280;">
+                    位置: ${detector.position_meters || 0}m<br>
+                    分区: ${detector.fire_zone_id || '未知'}
+                </span>
+            </div>
+        `, {
+            permanent: false,
+            direction: 'top',
+            offset: [0, -10]
+        });
+
+        marker.on('click', () => {
+            App.showDetectorDetail(detector.id);
+        });
+
+        if (detectorsVisible) {
+            marker.addTo(window.map);
+        }
+        
+        detectorMarkers[detector.id] = {
+            marker: marker,
+            detector: detector
+        };
+    }
+
+    function updateDetectorMarkers(detectors) {
+        detectors.forEach(detector => {
+            const markerData = detectorMarkers[detector.id];
+            if (markerData) {
+                const concentration = detector.current_concentration || 0;
+                const color = getConcentrationColor(concentration);
+                const isAlarm = concentration >= Config.ALARM_LEVEL1;
+
+                const icon = L.divIcon({
+                    className: 'custom-marker',
+                    html: `<div class="detector-marker ${isAlarm ? 'alarm' : ''}" style="background: ${color};"></div>`,
+                    iconSize: [16, 16],
+                    iconAnchor: [8, 8]
+                });
+
+                markerData.marker.setIcon(icon);
+                markerData.detector.current_concentration = concentration;
+
+                markerData.marker.setTooltipContent(`
+                    <div class="tooltip-content">
+                        <strong>检测器 ${detector.id}</strong><br>
+                        <span style="color: ${color}; font-weight: bold;">${concentration.toFixed(2)}% LEL</span><br>
+                        <span style="font-size: 11px; color: #6b7280;">
+                            位置: ${detector.position_meters || 0}m<br>
+                            分区: ${detector.fire_zone_id || '未知'}
+                        </span>
+                    </div>
+                `);
+            }
+        });
+    }
+
+    function clearDetectorMarkers() {
+        Object.values(detectorMarkers).forEach(({ marker }) => {
+            window.map.removeLayer(marker);
+        });
+        detectorMarkers = {};
+    }
+
+    async function addValveMarkers() {
+        try {
+            const response = await fetch(`${Config.API_URL}/valves`);
+            if (!response.ok) throw new Error('获取阀门列表失败');
+            const valves = await response.json();
+            
+            clearValveMarkers();
+            
+            valves.forEach(valve => {
+                if (valve.latitude && valve.longitude) {
+                    addValveMarker(valve);
+                }
+            });
+        } catch (error) {
+            console.error('加载阀门列表失败:', error);
+        }
+    }
+
+    function addValveMarker(valve) {
+        const isClosed = valve.status === 'closed';
+        const color = isClosed ? Config.COLORS.VALVE_CLOSED : Config.COLORS.VALVE;
+
+        const icon = L.divIcon({
+            className: 'custom-marker',
+            html: `<div class="valve-marker ${isClosed ? 'closed' : ''}" style="background: ${color};"></div>`,
+            iconSize: [14, 14],
+            iconAnchor: [7, 7]
+        });
+
+        const marker = L.marker([valve.latitude, valve.longitude], {
+            icon: icon,
+            title: valve.name || valve.id
+        });
+
+        marker.bindTooltip(`
+            <div class="tooltip-content">
+                <strong>${valve.name || '阀门 ' + valve.id}</strong><br>
+                <span style="color: ${color}; font-weight: bold;">
+                    ${isClosed ? '已关闭' : '已开启'}
+                </span><br>
+                <span style="font-size: 11px; color: #6b7280;">
+                    分区: ${valve.fire_zone_id || '未知'}
+                </span>
+            </div>
+        `, {
+            permanent: false,
+            direction: 'top',
+            offset: [0, -10]
+        });
+
+        if (valvesVisible) {
+            marker.addTo(window.map);
+        }
+        
+        valveMarkers[valve.id] = {
+            marker: marker,
+            valve: valve
+        };
+    }
+
+    function clearValveMarkers() {
+        Object.values(valveMarkers).forEach(({ marker }) => {
+            window.map.removeLayer(marker);
+        });
+        valveMarkers = {};
+    }
+
+    function updateLeakMarkers(leaks) {
+        const existingIds = new Set(Object.keys(leakMarkers));
+        const newIds = new Set(leaks.map(l => l.id.toString()));
+
+        leaks.forEach(leak => {
+            const leakId = leak.id.toString();
+            if (!existingIds.has(leakId)) {
+                addLeakMarker(leak);
+            } else {
+                if (leakCircles[leakId] && leak.diffusion_radius) {
+                    leakCircles[leakId].setRadius(leak.diffusion_radius);
+                }
+            }
+        });
+
+        existingIds.forEach(id => {
+            if (!newIds.has(id)) {
+                removeLeakMarker(id);
+            }
+        });
+    }
+
+    function addLeakMarker(leak) {
+        const leakId = leak.id.toString();
+        
+        if (leakMarkers[leakId]) {
+            removeLeakMarker(leakId);
+        }
+
+        const icon = L.divIcon({
+            className: 'custom-marker',
+            html: '<div class="leak-marker"></div>',
+            iconSize: [24, 24],
+            iconAnchor: [12, 12]
+        });
+
+        const marker = L.marker([leak.latitude, leak.longitude], {
+            icon: icon,
+            title: '泄漏源'
+        });
+
+        marker.bindTooltip(`
+            <div class="tooltip-content">
+                <strong style="color: #ef4444;">⚠️ 泄漏源</strong><br>
+                <span>位置: ${(leak.position_meters || 0).toFixed(0)}m</span><br>
+                <span>速率: ${(leak.leak_rate || 0).toFixed(4)} L/s</span><br>
+                <span>置信度: ${(leak.confidence || 0).toFixed(1)}%</span>
+            </div>
+        `, {
+            permanent: false,
+            direction: 'top',
+            offset: [0, -15]
+        });
+
+        if (leaksVisible) {
+            marker.addTo(window.map);
+        }
+
+        const circle = L.circle([leak.latitude, leak.longitude], {
+            radius: leak.diffusion_radius || 50,
+            color: '#ef4444',
+            fillColor: '#ef4444',
+            fillOpacity: 0.15,
+            weight: 2,
+            dashArray: '10, 5',
+            opacity: 0.6
+        });
+
+        if (leaksVisible) {
+            circle.addTo(window.map);
+        }
+
+        leakMarkers[leakId] = { marker, leak };
+        leakCircles[leakId] = circle;
+    }
+
+    function removeLeakMarker(leakId) {
+        if (leakMarkers[leakId]) {
+            window.map.removeLayer(leakMarkers[leakId].marker);
+            delete leakMarkers[leakId];
+        }
+        if (leakCircles[leakId]) {
+            window.map.removeLayer(leakCircles[leakId]);
+            delete leakCircles[leakId];
+        }
+    }
+
+    function getConcentrationColor(concentration) {
+        if (concentration >= Config.ALARM_LEVEL3) {
+            return Config.COLORS.LEVEL3;
+        } else if (concentration >= Config.ALARM_LEVEL2) {
+            return Config.COLORS.LEVEL2;
+        } else if (concentration >= Config.ALARM_LEVEL1) {
+            return Config.COLORS.LEVEL1;
+        }
+        return Config.COLORS.NORMAL;
+    }
+
+    function toggleDetectors() {
+        detectorsVisible = !detectorsVisible;
+        Object.values(detectorMarkers).forEach(({ marker }) => {
+            if (detectorsVisible) {
+                marker.addTo(window.map);
+            } else {
+                window.map.removeLayer(marker);
+            }
+        });
+        return detectorsVisible;
+    }
+
+    function toggleValves() {
+        valvesVisible = !valvesVisible;
+        Object.values(valveMarkers).forEach(({ marker }) => {
+            if (valvesVisible) {
+                marker.addTo(window.map);
+            } else {
+                window.map.removeLayer(marker);
+            }
+        });
+        return valvesVisible;
+    }
+
+    function toggleLeaks() {
+        leaksVisible = !leaksVisible;
+        Object.values(leakMarkers).forEach(({ marker }) => {
+            if (leaksVisible) {
+                marker.addTo(window.map);
+            } else {
+                window.map.removeLayer(marker);
+            }
+        });
+        Object.values(leakCircles).forEach(circle => {
+            if (leaksVisible) {
+                circle.addTo(window.map);
+            } else {
+                window.map.removeLayer(circle);
+            }
+        });
+        return leaksVisible;
+    }
+
+    function showDetectors(show) {
+        detectorsVisible = show;
+        Object.values(detectorMarkers).forEach(({ marker }) => {
+            if (show) {
+                marker.addTo(window.map);
+            } else {
+                window.map.removeLayer(marker);
+            }
+        });
+    }
+
+    function showValves(show) {
+        valvesVisible = show;
+        Object.values(valveMarkers).forEach(({ marker }) => {
+            if (show) {
+                marker.addTo(window.map);
+            } else {
+                window.map.removeLayer(marker);
+            }
+        });
+    }
+
+    function showLeaks(show) {
+        leaksVisible = show;
+        Object.values(leakMarkers).forEach(({ marker }) => {
+            if (show) {
+                marker.addTo(window.map);
+            } else {
+                window.map.removeLayer(marker);
+            }
+        });
+        Object.values(leakCircles).forEach(circle => {
+            if (show) {
+                circle.addTo(window.map);
+            } else {
+                window.map.removeLayer(circle);
+            }
+        });
+    }
+
+    return {
+        init: init,
+        loadPipeCorridor: loadPipeCorridor,
+        addDetectorMarkers: addDetectorMarkers,
+        addDetectorMarker: addDetectorMarker,
+        updateDetectorMarkers: updateDetectorMarkers,
+        addValveMarkers: addValveMarkers,
+        addValveMarker: addValveMarker,
+        updateLeakMarkers: updateLeakMarkers,
+        addLeakMarker: addLeakMarker,
+        removeLeakMarker: removeLeakMarker,
+        getConcentrationColor: getConcentrationColor,
+        toggleDetectors: toggleDetectors,
+        toggleValves: toggleValves,
+        toggleLeaks: toggleLeaks,
+        showDetectors: showDetectors,
+        showValves: showValves,
+        showLeaks: showLeaks
+    };
+})();
