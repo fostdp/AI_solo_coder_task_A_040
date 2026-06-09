@@ -37,18 +37,22 @@ type PostgreSQLConfig struct {
 }
 
 type InfluxDBConfig struct {
-	Host   string `mapstructure:"host"`
-	Token  string `mapstructure:"token"`
-	Org    string `mapstructure:"org"`
-	Bucket string `mapstructure:"bucket"`
+	Host           string `mapstructure:"host"`
+	Token          string `mapstructure:"token"`
+	Org            string `mapstructure:"org"`
+	Bucket         string `mapstructure:"bucket"`
+	BatchSize      int    `mapstructure:"batch_size"`
+	FlushIntervalMs int   `mapstructure:"flush_interval_ms"`
 }
 
 type MQTTConfig struct {
-	Broker   string            `mapstructure:"broker"`
-	ClientID string            `mapstructure:"client_id"`
-	Username string            `mapstructure:"username"`
-	Password string            `mapstructure:"password"`
-	Topics   map[string]string `mapstructure:"topics"`
+	Broker           string            `mapstructure:"broker"`
+	ClientID         string            `mapstructure:"client_id"`
+	Username         string            `mapstructure:"username"`
+	Password         string            `mapstructure:"password"`
+	Topics           map[string]string `mapstructure:"topics"`
+	CommandTimeoutSec int              `mapstructure:"command_timeout_sec"`
+	MaxRetries       int               `mapstructure:"max_retries"`
 }
 
 type AlarmConfig struct {

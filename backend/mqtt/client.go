@@ -1,12 +1,15 @@
 package mqtt
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 
 	"gas-monitoring-system/backend/config"
@@ -14,9 +17,45 @@ import (
 	"gas-monitoring-system/backend/services"
 )
 
+type CommandStatus string
+
+const (
+	CommandStatusPending   CommandStatus = "pending"
+	CommandStatusSent      CommandStatus = "sent"
+	CommandStatusConfirmed CommandStatus = "confirmed"
+	CommandStatusFailed    CommandStatus = "failed"
+	CommandStatusTimeout   CommandStatus = "timeout"
+)
+
+type PendingCommand struct {
+	ID            uuid.UUID
+	CommandType   string
+	TargetID      string
+	Action        string
+	Payload       map[string]interface{}
+	Topic         string
+	Status        CommandStatus
+	Retries       int
+	MaxRetries    int
+	CreatedAt     time.Time
+	LastSentAt    time.Time
+	Timeout       time.Duration
+	ConfirmTopic  string
+	OnConfirm     func()
+	OnTimeout     func()
+	OnError       func(error)
+}
+
 type MQTTService struct {
 	client mqtt.Client
 	cfg    *config.MQTTConfig
+	
+	pendingCommands map[uuid.UUID]*PendingCommand
+	commandsMutex   sync.RWMutex
+	retryTicker     *time.Ticker
+	
+	commandTimeout  time.Duration
+	maxRetries      int
 }
 
 var MQTT *MQTTService
@@ -48,10 +87,26 @@ func NewMQTTService(cfg *config.MQTTConfig) (*MQTTService, error) {
 		return nil, fmt.Errorf("failed to connect MQTT broker: %w", token.Error())
 	}
 
-	return &MQTTService{
-		client: client,
-		cfg:    cfg,
-	}, nil
+	commandTimeout := 30 * time.Second
+	maxRetries := 3
+	if cfg.CommandTimeoutSec > 0 {
+		commandTimeout = time.Duration(cfg.CommandTimeoutSec) * time.Second
+	}
+	if cfg.MaxRetries > 0 {
+		maxRetries = cfg.MaxRetries
+	}
+
+	mqttService := &MQTTService{
+		client:          client,
+		cfg:             cfg,
+		pendingCommands: make(map[uuid.UUID]*PendingCommand),
+		commandTimeout:  commandTimeout,
+		maxRetries:      maxRetries,
+	}
+
+	mqttService.startRetryLoop()
+
+	return mqttService, nil
 }
 
 func (m *MQTTService) subscribeTopics() {
@@ -68,6 +123,185 @@ func (m *MQTTService) subscribeTopics() {
 		token.Wait()
 		log.Printf("Subscribed to command topic: %s", topic)
 	}
+
+	confirmTopic := "devices/+/status"
+	token := m.client.Subscribe(confirmTopic, 1, m.handleDeviceStatus)
+	token.Wait()
+	log.Printf("Subscribed to device status topic: %s", confirmTopic)
+}
+
+func (m *MQTTService) startRetryLoop() {
+	m.retryTicker = time.NewTicker(5 * time.Second)
+	
+	go func() {
+		for range m.retryTicker.C {
+			m.checkPendingCommands()
+		}
+	}()
+	
+	log.Println("MQTT command retry loop started")
+}
+
+func (m *MQTTService) checkPendingCommands() {
+	m.commandsMutex.RLock()
+	commands := make([]*PendingCommand, 0, len(m.pendingCommands))
+	for _, cmd := range m.pendingCommands {
+		commands = append(commands, cmd)
+	}
+	m.commandsMutex.RUnlock()
+
+	now := time.Now()
+	for _, cmd := range commands {
+		m.commandsMutex.RLock()
+		_, exists := m.pendingCommands[cmd.ID]
+		m.commandsMutex.RUnlock()
+		
+		if !exists {
+			continue
+		}
+
+		if cmd.Status == CommandStatusConfirmed || cmd.Status == CommandStatusFailed {
+			m.removePendingCommand(cmd.ID)
+			continue
+		}
+
+		elapsed := now.Sub(cmd.LastSentAt)
+		if elapsed > cmd.Timeout {
+			if cmd.Retries < cmd.MaxRetries {
+				cmd.Retries++
+				log.Printf("[MQTT] Retrying command %s (%d/%d): %s %s", 
+					cmd.ID, cmd.Retries, cmd.MaxRetries, cmd.CommandType, cmd.Action)
+				
+				if err := m.sendCommand(cmd); err != nil {
+					log.Printf("[MQTT] Failed to retry command %s: %v", cmd.ID, err)
+				}
+			} else {
+				log.Printf("[MQTT] Command %s timed out after %d retries: %s %s", 
+					cmd.ID, cmd.Retries, cmd.CommandType, cmd.Action)
+				cmd.Status = CommandStatusTimeout
+				if cmd.OnTimeout != nil {
+					go cmd.OnTimeout()
+				}
+				m.removePendingCommand(cmd.ID)
+			}
+		}
+	}
+}
+
+func (m *MQTTService) removePendingCommand(cmdID uuid.UUID) {
+	m.commandsMutex.Lock()
+	delete(m.pendingCommands, cmdID)
+	m.commandsMutex.Unlock()
+}
+
+func (m *MQTTService) sendCommand(cmd *PendingCommand) error {
+	cmd.Payload["command_id"] = cmd.ID.String()
+	cmd.Payload["retry"] = cmd.Retries
+
+	data, err := json.Marshal(cmd.Payload)
+	if err != nil {
+		return err
+	}
+
+	token := m.client.Publish(cmd.Topic, 1, false, data)
+	if token.Wait() && token.Error() != nil {
+		return token.Error()
+	}
+
+	cmd.LastSentAt = time.Now()
+	cmd.Status = CommandStatusSent
+
+	return nil
+}
+
+func (m *MQTTService) SendReliableCommand(cmdType, targetID, action, topic string, 
+	payload map[string]interface{}, onConfirm, onTimeout func(), onError func(error)) error {
+
+	cmdID := uuid.New()
+	
+	cmd := &PendingCommand{
+		ID:           cmdID,
+		CommandType:  cmdType,
+		TargetID:     targetID,
+		Action:       action,
+		Payload:      payload,
+		Topic:        topic,
+		Status:       CommandStatusPending,
+		Retries:      0,
+		MaxRetries:   m.maxRetries,
+		CreatedAt:    time.Now(),
+		LastSentAt:   time.Now(),
+		Timeout:      m.commandTimeout,
+		ConfirmTopic: fmt.Sprintf("devices/%s/status", targetID),
+		OnConfirm:    onConfirm,
+		OnTimeout:    onTimeout,
+		OnError:      onError,
+	}
+
+	m.commandsMutex.Lock()
+	m.pendingCommands[cmdID] = cmd
+	m.commandsMutex.Unlock()
+
+	if err := m.sendCommand(cmd); err != nil {
+		m.removePendingCommand(cmdID)
+		return fmt.Errorf("failed to send command: %w", err)
+	}
+
+	log.Printf("[MQTT] Command sent: %s, type=%s, target=%s, action=%s", 
+		cmdID, cmdType, targetID, action)
+
+	return nil
+}
+
+func (m *MQTTService) handleDeviceStatus(client mqtt.Client, msg mqtt.Message) {
+	var status struct {
+		CommandID  string `json:"command_id"`
+		DeviceID   string `json:"device_id"`
+		Status     string `json:"status"`
+		Success    bool   `json:"success"`
+		Message    string `json:"message"`
+		Timestamp  int64  `json:"timestamp"`
+	}
+
+	if err := json.Unmarshal(msg.Payload(), &status); err != nil {
+		log.Printf("Failed to parse device status: %v", err)
+		return
+	}
+
+	if status.CommandID == "" {
+		return
+	}
+
+	cmdID, err := uuid.Parse(status.CommandID)
+	if err != nil {
+		return
+	}
+
+	m.commandsMutex.RLock()
+	cmd, exists := m.pendingCommands[cmdID]
+	m.commandsMutex.RUnlock()
+
+	if !exists {
+		return
+	}
+
+	if status.Success {
+		log.Printf("[MQTT] Command confirmed: %s, device=%s, status=%s", 
+			cmdID, status.DeviceID, status.Status)
+		cmd.Status = CommandStatusConfirmed
+		if cmd.OnConfirm != nil {
+			go cmd.OnConfirm()
+		}
+	} else {
+		log.Printf("[MQTT] Command failed: %s, device=%s, error=%s", 
+			cmdID, status.DeviceID, status.Message)
+		cmd.Status = CommandStatusFailed
+		if cmd.OnError != nil {
+			go cmd.OnError(fmt.Errorf(status.Message))
+		}
+	}
+
+	m.removePendingCommand(cmdID)
 }
 
 func (m *MQTTService) handleSensorData(client mqtt.Client, msg mqtt.Message) {
@@ -153,24 +387,68 @@ func (m *MQTTService) PublishAlarm(alarm *models.Alarm) error {
 func (m *MQTTService) ControlValve(valveID string, action string, reason string) error {
 	topic := fmt.Sprintf("valves/%s/control", valveID)
 	payload := map[string]interface{}{
-		"valve_id": valveID,
-		"action":   action,
-		"reason":   reason,
+		"valve_id":  valveID,
+		"action":    action,
+		"reason":    reason,
 		"timestamp": time.Now(),
 	}
-	return m.Publish(topic, payload)
+
+	onConfirm := func() {
+		log.Printf("[VALVE] Valve %s action %s confirmed", valveID, action)
+		if services.DB != nil {
+			go services.DB.LogValveControl(valveID, action, reason, true, "")
+		}
+	}
+
+	onTimeout := func() {
+		log.Printf("[VALVE] Valve %s action %s timeout", valveID, action)
+		if services.DB != nil {
+			go services.DB.LogValveControl(valveID, action, reason, false, "command timeout")
+		}
+	}
+
+	onError := func(err error) {
+		log.Printf("[VALVE] Valve %s action %s failed: %v", valveID, action, err)
+		if services.DB != nil {
+			go services.DB.LogValveControl(valveID, action, reason, false, err.Error())
+		}
+	}
+
+	return m.SendReliableCommand("valve", valveID, action, topic, payload, onConfirm, onTimeout, onError)
 }
 
 func (m *MQTTService) ControlFan(fanID string, action string, speed int, reason string) error {
 	topic := fmt.Sprintf("fans/%s/control", fanID)
 	payload := map[string]interface{}{
-		"fan_id":    fanID,
-		"action":    action,
-		"speed":     speed,
-		"reason":    reason,
-		"timestamp": time.Now(),
+		"fan_id":     fanID,
+		"action":     action,
+		"speed":      speed,
+		"reason":     reason,
+		"timestamp":  time.Now(),
 	}
-	return m.Publish(topic, payload)
+
+	onConfirm := func() {
+		log.Printf("[FAN] Fan %s action %s confirmed", fanID, action)
+		if services.DB != nil {
+			go services.DB.LogFanControl(fanID, action, reason, true, "")
+		}
+	}
+
+	onTimeout := func() {
+		log.Printf("[FAN] Fan %s action %s timeout", fanID, action)
+		if services.DB != nil {
+			go services.DB.LogFanControl(fanID, action, reason, false, "command timeout")
+		}
+	}
+
+	onError := func(err error) {
+		log.Printf("[FAN] Fan %s action %s failed: %v", fanID, action, err)
+		if services.DB != nil {
+			go services.DB.LogFanControl(fanID, action, reason, false, err.Error())
+		}
+	}
+
+	return m.SendReliableCommand("fan", fanID, action, topic, payload, onConfirm, onTimeout, onError)
 }
 
 func (m *MQTTService) SendNotification(message string, level int) error {
@@ -184,6 +462,11 @@ func (m *MQTTService) SendNotification(message string, level int) error {
 }
 
 func (m *MQTTService) Close() {
+	if m.retryTicker != nil {
+		m.retryTicker.Stop()
+		log.Println("MQTT command retry loop stopped")
+	}
+	
 	if m.client != nil {
 		m.client.Disconnect(250)
 		log.Println("MQTT client disconnected")

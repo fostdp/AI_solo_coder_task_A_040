@@ -189,13 +189,23 @@ func (l *LeakDetectorService) performDetection() {
 	psoCfg := algorithms.DefaultPSOConfig()
 	psoCfg.LoadFromConfig(l.cfg)
 
-	result, err := algorithms.LocalizeLeakSource(allReadings, model, psoCfg)
+	result, quality, err := algorithms.LocalizeLeakSourceWithQualityCheck(allReadings, model, psoCfg)
 	if err != nil {
 		log.Printf("Leak detection error: %v", err)
 		return
 	}
 
-	if result == nil || result.Confidence < 50 {
+	if quality.DegradedMode {
+		log.Printf("[QUALITY] 数据质量降级: %s, 质量分数: %.1f%%", 
+			quality.DegradationReason, quality.QualityScore)
+	}
+
+	minConfidence := 50.0
+	if quality.DegradedMode {
+		minConfidence = 40.0
+	}
+
+	if result == nil || result.Confidence < minConfidence {
 		l.mu.Lock()
 		l.currentLeaks = make([]*models.LeakSource, 0)
 		l.mu.Unlock()
@@ -233,8 +243,9 @@ func (l *LeakDetectorService) performDetection() {
 
 	l.mu.Unlock()
 
-	log.Printf("[LEAK] Detected leak at position %.1f, rate %.4f L/s, confidence %.1f%%, radius %.1fm",
-		leakSource.Position, leakSource.LeakRate, leakSource.Confidence, leakSource.DiffusionRadius)
+	log.Printf("[LEAK] Detected leak at position %.1f, rate %.4f L/s, confidence %.1f%%, radius %.1fm, quality: %.1f%%%s",
+		leakSource.Position, leakSource.LeakRate, leakSource.Confidence, leakSource.DiffusionRadius,
+		quality.QualityScore, map[bool]string{true: " (降级模式)", false: ""}[quality.DegradedMode])
 }
 
 func abs(x float64) float64 {

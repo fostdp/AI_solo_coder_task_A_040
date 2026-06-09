@@ -4,10 +4,12 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sync"
 	"time"
 
 	influxdb2 "github.com/influxdata/influxdb-client-go/v2"
 	influxdb2api "github.com/influxdata/influxdb-client-go/v2/api"
+	influxdb2options "github.com/influxdata/influxdb-client-go/v2/api/write"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"gas-monitoring-system/backend/config"
@@ -15,10 +17,17 @@ import (
 )
 
 type DatabaseService struct {
-	pgPool     *pgxpool.Pool
+	pgPool      *pgxpool.Pool
 	influxClient influxdb2.Client
-	writeAPI    influxdb2api.WriteAPI
-	queryAPI    influxdb2api.QueryAPI
+	writeAPI     influxdb2api.WriteAPI
+	queryAPI     influxdb2api.QueryAPI
+	
+	batchSize     int
+	flushInterval time.Duration
+	batchMutex    sync.Mutex
+	batchPoints   []*influxdb2options.Point
+	lastFlush     time.Time
+	batchTimer    *time.Timer
 }
 
 var DB *DatabaseService
@@ -37,12 +46,29 @@ func NewDatabaseService(cfg *config.Config) (*DatabaseService, error) {
 
 	influxClient, writeAPI, queryAPI := initInfluxDB(cfg.Database.InfluxDB)
 
-	return &DatabaseService{
-		pgPool:      pgPool,
-		influxClient: influxClient,
-		writeAPI:   writeAPI,
-		queryAPI:   queryAPI,
-	}, nil
+	batchSize := 5000
+	flushInterval := 100 * time.Millisecond
+	if cfg.Database.InfluxDB.BatchSize > 0 {
+		batchSize = cfg.Database.InfluxDB.BatchSize
+	}
+	if cfg.Database.InfluxDB.FlushIntervalMs > 0 {
+		flushInterval = time.Duration(cfg.Database.InfluxDB.FlushIntervalMs) * time.Millisecond
+	}
+
+	db := &DatabaseService{
+		pgPool:        pgPool,
+		influxClient:  influxClient,
+		writeAPI:      writeAPI,
+		queryAPI:      queryAPI,
+		batchSize:     batchSize,
+		flushInterval: flushInterval,
+		batchPoints:   make([]*influxdb2options.Point, 0, batchSize),
+		lastFlush:     time.Now(),
+	}
+
+	db.startBatchFlusher()
+
+	return db, nil
 }
 
 func initPostgreSQL(cfg config.PostgreSQLConfig) (*pgxpool.Pool, error) {
@@ -87,6 +113,12 @@ func initInfluxDB(cfg config.InfluxDBConfig) (influxdb2.Client, influxdb2api.Wri
 }
 
 func (d *DatabaseService) Close() {
+	if d.batchTimer != nil {
+		d.batchTimer.Stop()
+	}
+	
+	d.Flush()
+	
 	if d.pgPool != nil {
 		d.pgPool.Close()
 		log.Println("PostgreSQL connection closed")
@@ -102,6 +134,13 @@ func (d *DatabaseService) PG() *pgxpool.Pool {
 	return d.pgPool
 }
 
+func (d *DatabaseService) startBatchFlusher() {
+	d.batchTimer = time.AfterFunc(d.flushInterval, func() {
+		d.flushBatch()
+		d.batchTimer.Reset(d.flushInterval)
+	})
+}
+
 func (d *DatabaseService) WriteSensorData(data *models.InfluxSensorData) {
 	point := influxdb2.NewPointWithMeasurement(data.Measurement)
 	for k, v := range data.Tags {
@@ -111,10 +150,66 @@ func (d *DatabaseService) WriteSensorData(data *models.InfluxSensorData) {
 		point.AddField(k, v)
 	}
 	point.SetTime(data.Timestamp)
-	d.writeAPI.WritePoint(point)
+
+	d.batchMutex.Lock()
+	d.batchPoints = append(d.batchPoints, point)
+	
+	shouldFlush := len(d.batchPoints) >= d.batchSize
+	d.batchMutex.Unlock()
+
+	if shouldFlush {
+		go d.flushBatch()
+	}
+}
+
+func (d *DatabaseService) WriteSensorDataBatch(data []*models.InfluxSensorData) {
+	points := make([]*influxdb2options.Point, 0, len(data))
+	for _, item := range data {
+		point := influxdb2.NewPointWithMeasurement(item.Measurement)
+		for k, v := range item.Tags {
+			point.AddTag(k, v)
+		}
+		for k, v := range item.Fields {
+			point.AddField(k, v)
+		}
+		point.SetTime(item.Timestamp)
+		points = append(points, point)
+	}
+
+	d.batchMutex.Lock()
+	d.batchPoints = append(d.batchPoints, points...)
+	
+	shouldFlush := len(d.batchPoints) >= d.batchSize
+	d.batchMutex.Unlock()
+
+	if shouldFlush {
+		go d.flushBatch()
+	}
+}
+
+func (d *DatabaseService) flushBatch() {
+	d.batchMutex.Lock()
+	
+	if len(d.batchPoints) == 0 {
+		d.batchMutex.Unlock()
+		return
+	}
+	
+	points := d.batchPoints
+	d.batchPoints = make([]*influxdb2options.Point, 0, d.batchSize)
+	d.lastFlush = time.Now()
+	d.batchMutex.Unlock()
+
+	startTime := time.Now()
+	d.writeAPI.WritePoint(points...)
+	
+	if len(points) > 1000 {
+		log.Printf("InfluxDB batch flush: %d points in %v", len(points), time.Since(startTime))
+	}
 }
 
 func (d *DatabaseService) Flush() {
+	d.flushBatch()
 	d.writeAPI.Flush()
 }
 
@@ -223,4 +318,32 @@ func (d *DatabaseService) GetCurrentConcentrations() (map[string]float64, error)
 	}
 
 	return concentrations, result.Err()
+}
+
+func (d *DatabaseService) LogValveControl(valveID, action, reason string, success bool, errorMsg string) {
+	query := `
+		INSERT INTO valve_control_logs (valve_id, action, reason, success, error_message, timestamp)
+		VALUES ($1, $2, $3, $4, $5, NOW())
+	`
+	_, err := d.pgPool.Exec(context.Background(), query, valveID, action, reason, success, errorMsg)
+	if err != nil {
+		log.Printf("Failed to log valve control: %v", err)
+	}
+}
+
+func (d *DatabaseService) LogFanControl(fanID, action, reason string, success bool, errorMsg string) {
+	query := `
+		INSERT INTO fan_control_logs (fan_id, action, reason, success, error_message, timestamp)
+		VALUES ($1, $2, $3, $4, $5, NOW())
+	`
+	_, err := d.pgPool.Exec(context.Background(), query, fanID, action, reason, success, errorMsg)
+	if err != nil {
+		log.Printf("Failed to log fan control: %v", err)
+	}
+}
+
+func (d *DatabaseService) GetPendingCommandCount() int {
+	d.batchMutex.Lock()
+	defer d.batchMutex.Unlock()
+	return len(d.batchPoints)
 }

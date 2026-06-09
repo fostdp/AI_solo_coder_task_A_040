@@ -1,6 +1,7 @@
 package algorithms
 
 import (
+	"log"
 	"math"
 	"math/rand"
 	"sync"
@@ -51,11 +52,29 @@ type PSOConfig struct {
 }
 
 type GaussianPlumeModel struct {
-	WindSpeed   float64
-	WindDir     float64
-	Temperature float64
+	WindSpeed            float64
+	WindDir              float64
+	Temperature          float64
 	AtmosphericStability float64
 }
+
+type DataQualityReport struct {
+	ValidReadings      int
+	TotalReadings      int
+	WindSpeedValid     bool
+	WindDirValid       bool
+	ConcentrationRange float64
+	QualityScore       float64
+	DegradedMode       bool
+	DegradationReason  string
+}
+
+type AlgorithmType string
+
+const (
+	AlgorithmPSO   AlgorithmType = "pso"
+	AlgorithmBayes AlgorithmType = "bayes"
+)
 
 func (m *GaussianPlumeModel) CalculateConcentration(sourcePos, detectorPos, leakRate float64) float64 {
 	distance := math.Abs(sourcePos - detectorPos)
@@ -322,59 +341,246 @@ func calculateDiffusionRadius(leakRate, windSpeed, baseRadius float64) float64 {
 	return radius * windFactor
 }
 
+func AssessDataQuality(readings []DetectorReading, model *GaussianPlumeModel) DataQualityReport {
+	report := DataQualityReport{
+		TotalReadings:  len(readings),
+		WindSpeedValid: model.WindSpeed >= 0 && model.WindSpeed < 50,
+		WindDirValid:   model.WindDir >= 0 && model.WindDir <= 360,
+	}
+
+	validCount := 0
+	maxConc := 0.0
+	minConc := math.MaxFloat64
+
+	for _, r := range readings {
+		if r.Concentration >= 0 && r.Concentration < 1000 {
+			validCount++
+			if r.Concentration > maxConc {
+				maxConc = r.Concentration
+			}
+			if r.Concentration < minConc {
+				minConc = r.Concentration
+			}
+		}
+	}
+
+	report.ValidReadings = validCount
+	report.ConcentrationRange = maxConc - minConc
+
+	validRatio := float64(validCount) / float64(len(readings))
+	report.QualityScore = validRatio * 100
+
+	if !report.WindSpeedValid || !report.WindDirValid {
+		report.QualityScore *= 0.5
+		report.DegradedMode = true
+		if !report.WindSpeedValid && !report.WindDirValid {
+			report.DegradationReason = "风速风向传感器全部故障"
+		} else if !report.WindSpeedValid {
+			report.DegradationReason = "风速传感器故障"
+		} else {
+			report.DegradationReason = "风向传感器故障"
+		}
+	}
+
+	if validCount < 5 {
+		report.DegradedMode = true
+		report.DegradationReason = "有效读数不足"
+		report.QualityScore *= 0.5
+	}
+
+	if report.ConcentrationRange < 5.0 {
+		report.DegradedMode = true
+		report.DegradationReason = "浓度梯度不足"
+		report.QualityScore *= 0.7
+	}
+
+	return report
+}
+
+func SelectAlgorithm(quality DataQualityReport) AlgorithmType {
+	if quality.DegradedMode {
+		log.Printf("数据质量降级: %s, 质量分数: %.1f%%, 自动切换到PSO算法", 
+			quality.DegradationReason, quality.QualityScore)
+		return AlgorithmPSO
+	}
+
+	if quality.QualityScore >= 70 {
+		return AlgorithmBayes
+	}
+
+	return AlgorithmPSO
+}
+
+func LocalizeLeakSourceWithQualityCheck(readings []DetectorReading, model *GaussianPlumeModel, psoCfg PSOConfig) (*LeakSourceResult, DataQualityReport, error) {
+	quality := AssessDataQuality(readings, model)
+
+	if quality.ValidReadings < 3 {
+		return nil, quality, nil
+	}
+
+	algorithm := SelectAlgorithm(quality)
+
+	var result *LeakSourceResult
+	var err error
+
+	if algorithm == AlgorithmBayes {
+		log.Printf("使用贝叶斯推断算法, 数据质量: %.1f%%", quality.QualityScore)
+		result, err = BayesInference(readings, model)
+		
+		if err != nil || result == nil {
+			log.Printf("贝叶斯推断失败或无结果, 降级使用PSO算法")
+			result, err = LocalizeLeakSource(readings, model, psoCfg)
+		} else if result.Confidence < 30 {
+			log.Printf("贝叶斯推断置信度过低 (%.1f%%), 降级使用PSO算法验证", result.Confidence)
+			psoResult, psoErr := LocalizeLeakSource(readings, model, psoCfg)
+			if psoErr == nil && psoResult != nil && psoResult.Confidence > result.Confidence {
+				result = psoResult
+				log.Printf("PSO算法结果更优, 置信度: %.1f%%", result.Confidence)
+			}
+		}
+	} else {
+		log.Printf("使用PSO算法, 数据质量: %.1f%%", quality.QualityScore)
+		result, err = LocalizeLeakSource(readings, model, psoCfg)
+	}
+
+	return result, quality, err
+}
+
 func BayesInference(readings []DetectorReading, model *GaussianPlumeModel) (*LeakSourceResult, error) {
 	if len(readings) < 3 {
 		return nil, nil
 	}
 
-	gridResolution := 100.0
-	leakRateResolution := 0.1
-
-	maxProb := 0.0
-	bestPos := 15000.0
-	bestRate := 1.0
-
-	totalPositions := int(30000 / gridResolution)
-	totalRates := int(10.0 / leakRateResolution)
-
-	posterior := make([][]float64, totalPositions)
-	for i := range posterior {
-		posterior[i] = make([]float64, totalRates)
+	validReadings := make([]DetectorReading, 0, len(readings))
+	maxConc := 0.0
+	for _, r := range readings {
+		if r.Concentration >= 0.0 && r.Concentration < 1000 {
+			validReadings = append(validReadings, r)
+			if r.Concentration > maxConc {
+				maxConc = r.Concentration
+			}
+		}
 	}
 
+	if len(validReadings) < 3 || maxConc < 1.0 {
+		return nil, nil
+	}
+
+	estimatedCenter := estimateLeakPosition(validReadings)
+	searchRadius := math.Max(500.0, 3000.0*(maxConc/100.0))
+	searchMin := math.Max(0, estimatedCenter-searchRadius)
+	searchMax := math.Min(30000, estimatedCenter+searchRadius)
+
+	gridResolution := 50.0
+	leakRateResolution := 0.05
+
+	maxProb := 0.0
+	bestPos := estimatedCenter
+	bestRate := 1.0
+
+	totalPositions := int((searchMax - searchMin) / gridResolution)
+	totalRates := int(10.0 / leakRateResolution)
+
+	if totalPositions < 5 {
+		totalPositions = 5
+	}
+
+	logProb := 0.0
+	maxLogProb := math.Inf(-1)
+
 	for i := 0; i < totalPositions; i++ {
-		pos := float64(i) * gridResolution
+		pos := searchMin + float64(i)*gridResolution
 		for j := 0; j < totalRates; j++ {
 			rate := float64(j+1) * leakRateResolution
 
-			likelihood := 1.0
-			for _, r := range readings {
+			logLikelihood := 0.0
+			validCount := 0
+			for _, r := range validReadings {
 				if r.Concentration <= 0.0 {
 					continue
 				}
 
 				expected := model.CalculateConcentration(pos, r.Position, rate)
+				if expected < 0 {
+					expected = 0
+				}
 				error := r.Concentration - expected
 				stdDev := math.Max(0.5, r.Concentration*0.1)
-				likelihood *= math.Exp(-0.5*error*error/(stdDev*stdDev)) / (stdDev * math.Sqrt(2*math.Pi))
+				logLikelihood += -0.5*error*error/(stdDev*stdDev) - math.Log(stdDev*math.Sqrt(2*math.Pi))
+				validCount++
 			}
 
-			posterior[i][j] = likelihood
+			if validCount < 3 {
+				continue
+			}
 
-			if likelihood > maxProb {
-				maxProb = likelihood
+			logProb = logLikelihood
+
+			if logProb > maxLogProb {
+				maxLogProb = logProb
 				bestPos = pos
 				bestRate = rate
+				maxProb = math.Exp(logProb)
 			}
 		}
 	}
 
-	if maxProb < 1e-10 {
+	if maxLogProb == math.Inf(-1) || maxProb < 1e-20 {
 		return nil, nil
 	}
 
-	lat, lon := positionToLatLon(bestPos, readings)
-	confidence := math.Min(100, maxProb*100)
+	var posSum, rateSum, probSum float64
+	for i := 0; i < totalPositions; i++ {
+		pos := searchMin + float64(i)*gridResolution
+		for j := 0; j < totalRates; j++ {
+			rate := float64(j+1) * leakRateResolution
+
+			logLikelihood := 0.0
+			validCount := 0
+			for _, r := range validReadings {
+				if r.Concentration <= 0.0 {
+					continue
+				}
+
+				expected := model.CalculateConcentration(pos, r.Position, rate)
+				if expected < 0 {
+					expected = 0
+				}
+				error := r.Concentration - expected
+				stdDev := math.Max(0.5, r.Concentration*0.1)
+				logLikelihood += -0.5*error*error/(stdDev*stdDev) - math.Log(stdDev*math.Sqrt(2*math.Pi))
+				validCount++
+			}
+
+			if validCount < 3 {
+				continue
+			}
+
+			prob := math.Exp(logLikelihood - maxLogProb)
+			posSum += pos * prob
+			rateSum += rate * prob
+			probSum += prob
+		}
+	}
+
+	if probSum > 1e-10 {
+		bestPos = posSum / probSum
+		bestRate = rateSum / probSum
+	}
+
+	bestPos = math.Max(0, math.Min(30000, bestPos))
+	bestRate = math.Max(0.001, math.Min(10.0, bestRate))
+
+	if math.Abs(bestPos-estimatedCenter) > searchRadius*2 {
+		log.Printf("贝叶斯推断结果偏离估计中心过远 (%.0fm vs %.0fm), 使用估计中心", bestPos, estimatedCenter)
+		bestPos = estimatedCenter
+	}
+
+	lat, lon := positionToLatLon(bestPos, validReadings)
+	confidence := math.Min(100, -maxLogProb/100.0)
+	if confidence < 0 {
+		confidence = 50.0
+	}
 	diffusionRadius := calculateDiffusionRadius(bestRate, model.WindSpeed, config.AppConfig.LeakDetection.DiffusionRadiusBase)
 
 	return &LeakSourceResult{

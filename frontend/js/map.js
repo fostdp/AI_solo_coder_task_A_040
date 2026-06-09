@@ -7,6 +7,15 @@ const MapModule = (function() {
     let detectorsVisible = true;
     let valvesVisible = true;
     let leaksVisible = true;
+    
+    let clusterMarkers = {};
+    let isClusteringEnabled = true;
+    let clusterThreshold = 12;
+    let clusterGridSize = 80;
+    
+    let currentViewport = null;
+    let viewportUpdateScheduled = false;
+    let allDetectorsCache = [];
 
     function init() {
         window.map = L.map('map', {
@@ -14,7 +23,8 @@ const MapModule = (function() {
             zoom: Config.MAP_ZOOM,
             preferCanvas: true,
             zoomControl: true,
-            attributionControl: true
+            attributionControl: true,
+            renderer: L.canvas()
         });
 
         L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
@@ -22,6 +32,218 @@ const MapModule = (function() {
             maxZoom: 19,
             className: 'map-tiles'
         }).addTo(window.map);
+
+        window.map.on('moveend', handleViewportChange);
+        window.map.on('zoomend', handleViewportChange);
+    }
+
+    function handleViewportChange() {
+        if (viewportUpdateScheduled) return;
+        
+        viewportUpdateScheduled = true;
+        setTimeout(() => {
+            currentViewport = window.map.getBounds();
+            updateVisibleDetectors();
+            viewportUpdateScheduled = false;
+        }, 100);
+    }
+
+    function isInViewport(lat, lng) {
+        if (!currentViewport) return true;
+        return currentViewport.contains([lat, lng]);
+    }
+
+    function updateVisibleDetectors() {
+        if (!detectorsVisible || allDetectorsCache.length === 0) return;
+
+        const zoom = window.map.getZoom();
+        const shouldCluster = isClusteringEnabled && zoom < clusterThreshold;
+
+        if (shouldCluster) {
+            updateClusterMarkers();
+        } else {
+            clearClusterMarkers();
+            updateIndividualMarkers();
+        }
+    }
+
+    function updateIndividualMarkers() {
+        let visibleCount = 0;
+        let hiddenCount = 0;
+
+        allDetectorsCache.forEach(detector => {
+            if (!detector.latitude || !detector.longitude) return;
+
+            const inView = isInViewport(detector.latitude, detector.longitude);
+            const markerData = detectorMarkers[detector.id];
+
+            if (inView) {
+                visibleCount++;
+                if (!markerData) {
+                    addDetectorMarker(detector);
+                }
+            } else {
+                hiddenCount++;
+                if (markerData && markerData.marker) {
+                    window.map.removeLayer(markerData.marker);
+                    delete detectorMarkers[detector.id];
+                }
+            }
+        });
+
+        if (visibleCount + hiddenCount > 0) {
+            console.log(`视口内检测器: ${visibleCount}, 视口外已隐藏: ${hiddenCount}`);
+        }
+    }
+
+    function updateClusterMarkers() {
+        clearClusterMarkers();
+        clearIndividualMarkers();
+
+        const clusters = clusterDetectors(allDetectorsCache);
+        let clusterCount = 0;
+
+        clusters.forEach(cluster => {
+            if (cluster.count === 1) {
+                addDetectorMarker(cluster.detectors[0]);
+            } else {
+                addClusterMarker(cluster);
+                clusterCount++;
+            }
+        });
+
+        if (clusterCount > 0) {
+            console.log(`聚合显示: ${clusterCount}个聚合点, 共${allDetectorsCache.length}个检测器`);
+        }
+    }
+
+    function clusterDetectors(detectors) {
+        const clusters = [];
+        const mapZoom = window.map.getZoom();
+        const gridSize = clusterGridSize / Math.pow(2, mapZoom - 10);
+
+        const grid = {};
+
+        detectors.forEach(detector => {
+            if (!detector.latitude || !detector.longitude) return;
+            
+            const point = window.map.latLngToContainerPoint([detector.latitude, detector.longitude]);
+            const gridX = Math.floor(point.x / gridSize);
+            const gridY = Math.floor(point.y / gridSize);
+            const gridKey = `${gridX}_${gridY}`;
+
+            if (!grid[gridKey]) {
+                grid[gridKey] = {
+                    detectors: [],
+                    sumLat: 0,
+                    sumLng: 0,
+                    maxConc: 0,
+                    alarmCount: 0
+                };
+            }
+
+            grid[gridKey].detectors.push(detector);
+            grid[gridKey].sumLat += detector.latitude;
+            grid[gridKey].sumLng += detector.longitude;
+            grid[gridKey].maxConc = Math.max(grid[gridKey].maxConc, detector.current_concentration || 0);
+            if (detector.current_concentration >= Config.ALARM_LEVEL1) {
+                grid[gridKey].alarmCount++;
+            }
+        });
+
+        Object.values(grid).forEach(gridData => {
+            if (gridData.detectors.length === 0) return;
+
+            const centerLat = gridData.sumLat / gridData.detectors.length;
+            const centerLng = gridData.sumLng / gridData.detectors.length;
+            const maxConc = gridData.maxConc;
+            const count = gridData.detectors.length;
+            const alarmCount = gridData.alarmCount;
+
+            clusters.push({
+                count: count,
+                alarmCount: alarmCount,
+                maxConc: maxConc,
+                centerLat: centerLat,
+                centerLng: centerLng,
+                detectors: gridData.detectors
+            });
+        });
+
+        return clusters;
+    }
+
+    function addClusterMarker(cluster) {
+        const color = getConcentrationColor(cluster.maxConc);
+        const isAlarm = cluster.alarmCount > 0;
+        const size = Math.min(40, 16 + cluster.count * 0.5);
+
+        const icon = L.divIcon({
+            className: 'custom-marker cluster-marker',
+            html: `
+                <div class="cluster-marker-inner ${isAlarm ? 'alarm' : ''}" 
+                     style="background: ${color}; width: ${size}px; height: ${size}px; line-height: ${size}px;">
+                    ${cluster.count}
+                    ${cluster.alarmCount > 0 ? `<span class="cluster-alarm-badge">${cluster.alarmCount}</span>` : ''}
+                </div>
+            `,
+            iconSize: [size, size],
+            iconAnchor: [size / 2, size / 2]
+        });
+
+        const marker = L.marker([cluster.centerLat, cluster.centerLng], {
+            icon: icon,
+            title: `聚合点 (${cluster.count}个检测器)`
+        });
+
+        const detectorsList = cluster.detectors.map(d => 
+            `• ${d.id}: ${(d.current_concentration || 0).toFixed(2)}%LEL`
+        ).join('<br>');
+
+        marker.bindTooltip(`
+            <div class="tooltip-content">
+                <strong>聚合点 (${cluster.count}个检测器)</strong><br>
+                <span style="color: ${color}; font-weight: bold;">
+                    最高浓度: ${cluster.maxConc.toFixed(2)}% LEL
+                </span>
+                <br>
+                ${cluster.alarmCount > 0 ? `<span style="color: #ef4444;">告警: ${cluster.alarmCount}个</span><br>` : ''}
+                <div style="margin-top: 4px; font-size: 11px; max-height: 100px; overflow-y: auto;">
+                    ${detectorsList}
+                </div>
+            </div>
+        `, {
+            permanent: false,
+            direction: 'top',
+            offset: [0, -10]
+        });
+
+        marker.on('click', () => {
+            window.map.flyTo([cluster.centerLat, cluster.centerLng], window.map.getZoom() + 2);
+        });
+
+        marker.addTo(window.map);
+        
+        const key = `cluster_${cluster.centerLat.toFixed(6)}_${cluster.centerLng.toFixed(6)}`;
+        clusterMarkers[key] = { marker, cluster };
+    }
+
+    function clearClusterMarkers() {
+        Object.values(clusterMarkers).forEach(({ marker }) => {
+            if (marker && window.map.hasLayer(marker)) {
+                window.map.removeLayer(marker);
+            }
+        });
+        clusterMarkers = {};
+    }
+
+    function clearIndividualMarkers() {
+        Object.values(detectorMarkers).forEach(({ marker }) => {
+            if (marker && window.map.hasLayer(marker)) {
+                window.map.removeLayer(marker);
+            }
+        });
+        detectorMarkers = {};
     }
 
     async function loadPipeCorridor() {
@@ -42,7 +264,9 @@ const MapModule = (function() {
                     weight: 10,
                     opacity: 0.3,
                     lineJoin: 'round',
-                    lineCap: 'round'
+                    lineCap: 'round',
+                    interactive: false,
+                    pane: 'tilePane'
                 }).addTo(window.map);
 
                 pipeCorridorLayer = L.polyline(latlngs, {
@@ -50,10 +274,10 @@ const MapModule = (function() {
                     weight: 6,
                     opacity: 0.8,
                     lineJoin: 'round',
-                    lineCap: 'round'
+                    lineCap: 'round',
+                    interactive: false,
+                    pane: 'tilePane'
                 }).addTo(window.map);
-
-                pipeCorridorLayer.bringToFront();
 
                 const bounds = L.latLngBounds(latlngs);
                 window.map.fitBounds(bounds, { padding: [50, 50] });
@@ -64,13 +288,12 @@ const MapModule = (function() {
     }
 
     function addDetectorMarkers(detectors) {
+        allDetectorsCache = detectors;
         clearDetectorMarkers();
+        clearClusterMarkers();
         
-        detectors.forEach(detector => {
-            if (detector.latitude && detector.longitude) {
-                addDetectorMarker(detector);
-            }
-        });
+        currentViewport = window.map.getBounds();
+        updateVisibleDetectors();
     }
 
     function addDetectorMarker(detector) {
@@ -109,9 +332,7 @@ const MapModule = (function() {
             App.showDetectorDetail(detector.id);
         });
 
-        if (detectorsVisible) {
-            marker.addTo(window.map);
-        }
+        marker.addTo(window.map);
         
         detectorMarkers[detector.id] = {
             marker: marker,
@@ -120,13 +341,28 @@ const MapModule = (function() {
     }
 
     function updateDetectorMarkers(detectors) {
+        allDetectorsCache = detectors;
+        
+        const zoom = window.map.getZoom();
+        const shouldCluster = isClusteringEnabled && zoom < clusterThreshold;
+
+        if (shouldCluster) {
+            updateClusterMarkers();
+            return;
+        }
+
         detectors.forEach(detector => {
+            if (!detector.latitude || !detector.longitude) return;
+
+            const inView = isInViewport(detector.latitude, detector.longitude);
+            if (!inView) return;
+
+            const concentration = detector.current_concentration || 0;
+            const color = getConcentrationColor(concentration);
+            const isAlarm = concentration >= Config.ALARM_LEVEL1;
+
             const markerData = detectorMarkers[detector.id];
             if (markerData) {
-                const concentration = detector.current_concentration || 0;
-                const color = getConcentrationColor(concentration);
-                const isAlarm = concentration >= Config.ALARM_LEVEL1;
-
                 const icon = L.divIcon({
                     className: 'custom-marker',
                     html: `<div class="detector-marker ${isAlarm ? 'alarm' : ''}" style="background: ${color};"></div>`,
@@ -147,15 +383,14 @@ const MapModule = (function() {
                         </span>
                     </div>
                 `);
+            } else {
+                addDetectorMarker(detector);
             }
         });
     }
 
     function clearDetectorMarkers() {
-        Object.values(detectorMarkers).forEach(({ marker }) => {
-            window.map.removeLayer(marker);
-        });
-        detectorMarkers = {};
+        clearIndividualMarkers();
     }
 
     async function addValveMarkers() {
@@ -290,7 +525,8 @@ const MapModule = (function() {
             fillOpacity: 0.15,
             weight: 2,
             dashArray: '10, 5',
-            opacity: 0.6
+            opacity: 0.6,
+            interactive: false
         });
 
         if (leaksVisible) {
@@ -325,13 +561,14 @@ const MapModule = (function() {
 
     function toggleDetectors() {
         detectorsVisible = !detectorsVisible;
-        Object.values(detectorMarkers).forEach(({ marker }) => {
-            if (detectorsVisible) {
-                marker.addTo(window.map);
-            } else {
-                window.map.removeLayer(marker);
-            }
-        });
+        
+        if (detectorsVisible) {
+            currentViewport = window.map.getBounds();
+            updateVisibleDetectors();
+        } else {
+            clearIndividualMarkers();
+            clearClusterMarkers();
+        }
         return detectorsVisible;
     }
 
@@ -368,13 +605,13 @@ const MapModule = (function() {
 
     function showDetectors(show) {
         detectorsVisible = show;
-        Object.values(detectorMarkers).forEach(({ marker }) => {
-            if (show) {
-                marker.addTo(window.map);
-            } else {
-                window.map.removeLayer(marker);
-            }
-        });
+        if (show) {
+            currentViewport = window.map.getBounds();
+            updateVisibleDetectors();
+        } else {
+            clearIndividualMarkers();
+            clearClusterMarkers();
+        }
     }
 
     function showValves(show) {

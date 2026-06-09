@@ -15,6 +15,8 @@ database:
     token: your-token-here
     org: smart-city
     bucket: gas-data
+    batch_size: 5000
+    flush_interval_ms: 100
 
 mqtt:
   broker: tcp://localhost:1883
@@ -26,6 +28,8 @@ mqtt:
     valve_control: "valves/+/control"
     alarm: "alarms/+"
     command: "commands/#"
+  command_timeout_sec: 30
+  max_retries: 3
 
 alarm:
   level1_threshold: 10.0

@@ -1179,3 +1179,55 @@ body {
     border-radius: 8px;
     border: 1px solid #2d3561;
 }
+
+.cluster-marker {
+    border: none !important;
+    background: transparent !important;
+}
+
+.cluster-marker-inner {
+    border-radius: 50%;
+    text-align: center;
+    font-weight: bold;
+    font-size: 12px;
+    color: white;
+    text-shadow: 0 1px 2px rgba(0, 0, 0, 0.5);
+    border: 2px solid rgba(255, 255, 255, 0.8);
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+    transition: transform 0.2s ease;
+    position: relative;
+}
+
+.cluster-marker-inner:hover {
+    transform: scale(1.1);
+    z-index: 1000 !important;
+}
+
+.cluster-marker-inner.alarm {
+    animation: cluster-pulse 1.5s infinite;
+}
+
+@keyframes cluster-pulse {
+    0%, 100% {
+        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3), 0 0 0 0 rgba(239, 68, 68, 0.4);
+    }
+    50% {
+        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3), 0 0 0 10px rgba(239, 68, 68, 0);
+    }
+}
+
+.cluster-alarm-badge {
+    position: absolute;
+    top: -4px;
+    right: -4px;
+    background: #ef4444;
+    color: white;
+    font-size: 10px;
+    font-weight: bold;
+    padding: 1px 5px;
+    border-radius: 8px;
+    border: 1px solid white;
+    min-width: 16px;
+    text-align: center;
+    line-height: 1.2;
+}
