@@ -1,0 +1,65 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  scrape_timeout: 10s
+
+  external_labels:
+    monitor: 'gas-monitoring-system'
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: []
+
+rule_files:
+  - "rules/*.yml"
+
+scrape_configs:
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  - job_name: 'gas-monitor-backend'
+    metrics_path: '/metrics'
+    scheme: 'http'
+    static_configs:
+      - targets: ['backend:8080']
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+        replacement: 'gas-monitor-backend'
+    metric_relabel_configs:
+      - source_labels: [__name__]
+        regex: 'go_(.*)'
+        action: keep
+      - source_labels: [__name__]
+        regex: 'process_(.*)'
+        action: keep
+      - source_labels: [__name__]
+        regex: 'gas_monitoring_(.*)'
+        action: keep
+
+  - job_name: 'gas-monitor-pprof'
+    metrics_path: '/debug/pprof'
+    scheme: 'http'
+    static_configs:
+      - targets: ['backend:6060']
+    params:
+      debug: ['2']
+    scrape_interval: 60s
+    scrape_timeout: 30s
+
+  - job_name: 'mosquitto'
+    static_configs:
+      - targets: ['mosquitto:9001']
+    metrics_path: '/'
+    scrape_interval: 30s
+
+  - job_name: 'simulator'
+    metrics_path: '/metrics'
+    scheme: 'http'
+    static_configs:
+      - targets: ['simulator:8081']
+    scrape_interval: 30s
+    params:
+      format: ['prometheus']

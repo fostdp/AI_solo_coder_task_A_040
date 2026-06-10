@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"log"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"syscall"
@@ -19,8 +21,25 @@ import (
 	"gas-monitoring-system/backend/services"
 )
 
+var (
+	version   = "dev"
+	buildTime = "unknown"
+	startTime = time.Now()
+)
+
 func main() {
-	log.Println("=== 智慧城市地下综合管廊燃气泄漏监测系统启动 ===")
+	log.Printf("=== 智慧城市地下综合管廊燃气泄漏监测系统启动 ===")
+	log.Printf("Version: %s, BuildTime: %s", version, buildTime)
+
+	go func() {
+		log.Println("Starting pprof server on :6060")
+		if err := http.ListenAndServe("0.0.0.0:6060", nil); err != nil {
+			log.Printf("pprof server error: %v", err)
+		}
+	}()
+
+	services.InitMetrics()
+	services.StartTime = startTime
 
 	cfg, err := config.LoadConfig("config/config.yaml")
 	if err != nil {

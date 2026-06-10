@@ -1,0 +1,76 @@
+bucket = "sensor_data"
+raw_bucket = "sensor_data"
+five_min_bucket = "sensor_data_5m"
+hourly_bucket = "sensor_data_1h"
+
+option v = {timeRangeStart: -30d, timeRangeStop: now()}
+
+data = from(bucket: raw_bucket)
+  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)
+
+five_min_data = data
+  |> filter(fn: (r) => r._measurement == "laser_reading")
+  |> aggregateWindow(every: 5m, fn: mean, createEmpty: false)
+  |> to(bucket: five_min_bucket)
+
+five_min_data = data
+  |> filter(fn: (r) => r._measurement == "laser_reading")
+  |> aggregateWindow(every: 5m, fn: max, createEmpty: false)
+  |> set(key: "_field", value: "concentration_max")
+  |> to(bucket: five_min_bucket)
+
+hourly_data = from(bucket: five_min_bucket)
+  |> range(start: -90d)
+  |> filter(fn: (r) => r._measurement == "laser_reading")
+  |> aggregateWindow(every: 1h, fn: mean, createEmpty: false)
+  |> to(bucket: hourly_bucket)
+
+task name: "downsample_sensor_data_to_5m" {
+  option task = {
+    name: "downsample_sensor_data_to_5m",
+    every: 5m,
+    offset: 0m,
+    concurrency: 1,
+    retry: 3
+  }
+
+  from(bucket: raw_bucket)
+    |> range(start: -10m)
+    |> filter(fn: (r) => r._measurement == "laser_reading")
+    |> aggregateWindow(every: 5m, fn: mean, createEmpty: false)
+    |> set(key: "_field", value: "concentration_mean")
+    |> to(bucket: five_min_bucket)
+}
+
+task name: "downsample_sensor_data_max_to_5m" {
+  option task = {
+    name: "downsample_sensor_data_max_to_5m",
+    every: 5m,
+    offset: 30s,
+    concurrency: 1,
+    retry: 3
+  }
+
+  from(bucket: raw_bucket)
+    |> range(start: -10m)
+    |> filter(fn: (r) => r._measurement == "laser_reading")
+    |> aggregateWindow(every: 5m, fn: max, createEmpty: false)
+    |> set(key: "_field", value: "concentration_max")
+    |> to(bucket: five_min_bucket)
+}
+
+task name: "downsample_sensor_data_to_1h" {
+  option task = {
+    name: "downsample_sensor_data_to_1h",
+    every: 1h,
+    offset: 5m,
+    concurrency: 1,
+    retry: 3
+  }
+
+  from(bucket: five_min_bucket)
+    |> range(start: -2h)
+    |> filter(fn: (r) => r._field == "concentration_mean")
+    |> aggregateWindow(every: 1h, fn: mean, createEmpty: false)
+    |> to(bucket: hourly_bucket)
+}

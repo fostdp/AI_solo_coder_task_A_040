@@ -1,9 +1,37 @@
 package api
 
 import (
+	"net/http"
+	"time"
+
 	"github.com/gin-contrib/cors"
+	"github.com/gin-contrib/gzip"
 	"github.com/gin-gonic/gin"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+
+	"gas-monitoring-system/backend/services"
 )
+
+func prometheusHandler() gin.HandlerFunc {
+	h := promhttp.Handler()
+	return func(c *gin.Context) {
+		h.ServeHTTP(c.Writer, c.Request)
+	}
+}
+
+func metricsMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		start := time.Now()
+		c.Next()
+		duration := time.Since(start).Seconds()
+		status := c.Writer.Status()
+		services.HTTPRequestDuration.WithLabelValues(
+			c.Request.Method,
+			c.FullPath(),
+			http.StatusText(status),
+		).Observe(duration)
+	}
+}
 
 func SetupRouter() *gin.Engine {
 	r := gin.Default()
@@ -13,6 +41,10 @@ func SetupRouter() *gin.Engine {
 	config.AllowMethods = []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"}
 	config.AllowHeaders = []string{"Origin", "Content-Type", "Accept", "Authorization"}
 	r.Use(cors.New(config))
+	r.Use(gzip.Gzip(gzip.DefaultCompression))
+	r.Use(metricsMiddleware())
+
+	r.GET("/metrics", prometheusHandler())
 
 	h := NewHandler()
 
